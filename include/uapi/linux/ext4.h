@@ -34,6 +34,12 @@
 #define EXT4_IOC_GETFSUUID		_IOR('f', 44, struct fsuuid)
 #define EXT4_IOC_SETFSUUID		_IOW('f', 44, struct fsuuid)
 
+/*
+ * Experimental BRC interfaces.
+ * Research prototype; not a stable userspace ABI.
+ */
+#define EXT4_IOC_BRC_TEST            _IO('f', 45)
+
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 
 /*

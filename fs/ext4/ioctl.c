@@ -1245,6 +1245,14 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	ext4_debug("cmd = %u, arg = %lu\n", cmd, arg);
 
 	switch (cmd) {
+	case EXT4_IOC_BRC_TEST:
+		ext4_msg(sb, KERN_INFO,
+			"BRC_TEST: inode=%lu size=%lld blocks=%llu",
+			inode->i_ino,
+			(long long)i_size_read(inode),
+			(unsigned long long)inode->i_blocks);
+		return 0;
+
 	case FS_IOC_GETFSMAP:
 		return ext4_ioc_getfsmap(sb, (void __user *)arg);
 	case EXT4_IOC_GETVERSION:

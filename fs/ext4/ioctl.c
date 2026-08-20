@@ -1236,6 +1236,102 @@ static int ext4_ioctl_setuuid(struct file *filp,
 	return ret;
 }
 
+static long ext4_ioctl_brc_create(struct file *file, unsigned long arg)
+{
+	struct ext4_brc_create create;
+	struct inode *child_inode = file_inode(file);
+	struct inode *parent_inode;
+	struct file *parent_file;
+	struct fd parent;
+	unsigned int i;
+	long ret = 0;
+
+	if (copy_from_user(&create, (void __user *)arg, sizeof(create)))
+		return -EFAULT;
+
+	if (create.flags)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(create.reserved); i++) {
+		if (create.reserved[i])
+			return -EINVAL;
+	}
+
+	if (!S_ISREG(child_inode->i_mode))
+		return -EINVAL;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+
+	if (i_size_read(child_inode) != 0)
+		return -EINVAL;
+
+	parent = fdget(create.parent_fd);
+	parent_file = fd_file(parent);
+	if (!parent_file)
+		return -EBADF;
+
+	parent_inode = file_inode(parent_file);
+
+	if (!S_ISREG(parent_inode->i_mode)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!(parent_file->f_mode & FMODE_READ)) {
+		ret = -EBADF;
+		goto out;
+	}
+
+	if (parent_inode == child_inode) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (parent_inode->i_sb != child_inode->i_sb) {
+		ret = -EXDEV;
+		goto out;
+	}
+
+	ext4_msg(child_inode->i_sb, KERN_INFO,
+		 "BRC_CREATE: parent_inode=%lu child_inode=%lu",
+		 parent_inode->i_ino, child_inode->i_ino);
+
+out:
+	fdput(parent);
+	return ret;
+}
+
+
+static long ext4_ioctl_brc_seal(struct file *file, unsigned long arg)
+{
+	struct ext4_brc_control control;
+	struct inode *inode = file_inode(file);
+	unsigned int i;
+
+	if (copy_from_user(&control, (void __user *)arg, sizeof(control)))
+		return -EFAULT;
+
+	if (control.flags)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(control.reserved); i++) {
+		if (control.reserved[i])
+			return -EINVAL;
+	}
+
+	if (!S_ISREG(inode->i_mode))
+		return -EINVAL;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+
+	ext4_msg(inode->i_sb, KERN_INFO,
+		 "BRC_SEAL: inode=%lu", inode->i_ino);
+
+	return 0;
+}
+
 static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
@@ -1252,6 +1348,11 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			(long long)i_size_read(inode),
 			(unsigned long long)inode->i_blocks);
 		return 0;
+
+	case EXT4_IOC_BRC_CREATE:
+		return ext4_ioctl_brc_create(filp, arg);
+	case EXT4_IOC_BRC_SEAL:
+		return ext4_ioctl_brc_seal(filp, arg);
 
 	case FS_IOC_GETFSMAP:
 		return ext4_ioc_getfsmap(sb, (void __user *)arg);
@@ -1717,6 +1818,9 @@ long ext4_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case FS_IOC_SETFSLABEL:
 	case EXT4_IOC_GETFSUUID:
 	case EXT4_IOC_SETFSUUID:
+	case EXT4_IOC_BRC_TEST:
+	case EXT4_IOC_BRC_CREATE:
+	case EXT4_IOC_BRC_SEAL:
 		break;
 	default:
 		return -ENOIOCTLCMD;

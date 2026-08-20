@@ -39,6 +39,8 @@
  * Research prototype; not a stable userspace ABI.
  */
 #define EXT4_IOC_BRC_TEST            _IO('f', 45)
+#define EXT4_IOC_BRC_CREATE		_IOW('f', 46, struct ext4_brc_create)
+#define EXT4_IOC_BRC_SEAL		_IOW('f', 47, struct ext4_brc_control)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 
@@ -82,6 +84,26 @@ struct fsuuid {
 	__u32       fsu_len;
 	__u32       fsu_flags;
 	__u8        fsu_uuid[];
+};
+
+/*
+ * Arguments for EXT4_IOC_BRC_CREATE.
+ *
+ * The ioctl is issued on the new checkpoint file. parent_fd refers
+ * to the predecessor checkpoint in the same ext4 filesystem.
+ */
+struct ext4_brc_create {
+	__s32 parent_fd;
+	__u32 flags;
+	__u32 reserved[4];
+};
+
+/*
+ * Arguments for BRC checkpoint control operations.
+ */
+struct ext4_brc_control {
+	__u32 flags;
+	__u32 reserved[5];
 };
 
 /*

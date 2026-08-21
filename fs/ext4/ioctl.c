@@ -1236,6 +1236,79 @@ static int ext4_ioctl_setuuid(struct file *filp,
 	return ret;
 }
 
+#define EXT4_BRC_DUMP_MAX_RUNS 64
+
+static int ext4_brc_dump_mapping(struct inode *inode)
+{
+        ext4_lblk_t lblk = 0;
+        u64 size = i_size_read(inode);
+        u64 nr_blocks;
+        unsigned int runs = 0;
+
+        if (!size) {
+                ext4_msg(inode->i_sb, KERN_INFO,
+                         "BRC_MAP: inode=%lu empty",
+                         inode->i_ino);
+                return 0;
+        }
+
+        nr_blocks = DIV_ROUND_UP_ULL(size,
+                                    1ULL << inode->i_blkbits);
+
+        while ((u64)lblk < nr_blocks) {
+                struct ext4_map_blocks map = {
+                        .m_lblk = lblk,
+                        .m_len = min_t(u64,
+                                      nr_blocks - lblk,
+                                      INT_MAX),
+                };
+                const char *state;
+                int ret;
+
+                ret = ext4_map_blocks(NULL, inode, &map, 0);
+                if (ret < 0)
+                        return ret;
+
+                /*
+                 * m_len must make forward progress even for holes.
+                 * Avoid an infinite loop if the mapping result is
+                 * unexpectedly malformed.
+                 */
+                if (!map.m_len)
+                        return -EFSCORRUPTED;
+
+                if (map.m_flags & EXT4_MAP_MAPPED)
+                        state = "MAPPED";
+                else if (map.m_flags & EXT4_MAP_UNWRITTEN)
+                        state = "UNWRITTEN";
+                else if (map.m_flags & EXT4_MAP_DELAYED)
+                        state = "DELAYED";
+                else
+                        state = "HOLE";
+
+                ext4_msg(inode->i_sb, KERN_INFO,
+                         "BRC_MAP: inode=%lu lblk=%u len=%u pblk=%llu state=%s flags=0x%x",
+                         inode->i_ino,
+                         map.m_lblk,
+                         map.m_len,
+                         (unsigned long long)map.m_pblk,
+                         state,
+                         map.m_flags);
+
+                lblk += map.m_len;
+
+                if (++runs >= EXT4_BRC_DUMP_MAX_RUNS &&
+                    (u64)lblk < nr_blocks) {
+                        ext4_msg(inode->i_sb, KERN_INFO,
+                                 "BRC_MAP: inode=%lu output truncated after %u runs",
+                                 inode->i_ino, runs);
+                        break;
+                }
+        }
+
+        return 0;
+}
+
 static long ext4_ioctl_brc_create(struct file *file, unsigned long arg)
 {
 	struct ext4_brc_create create;
@@ -1293,9 +1366,21 @@ static long ext4_ioctl_brc_create(struct file *file, unsigned long arg)
 		goto out;
 	}
 
+	/*
+	 * The first BRC prototype only supports extent-mapped files.
+	 */
+	if (!ext4_test_inode_flag(parent_inode, EXT4_INODE_EXTENTS)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
 	ext4_msg(child_inode->i_sb, KERN_INFO,
 		 "BRC_CREATE: parent_inode=%lu child_inode=%lu",
 		 parent_inode->i_ino, child_inode->i_ino);
+
+	ret = ext4_brc_dump_mapping(parent_inode);
+	if (ret)
+		goto out;
 
 out:
 	fdput(parent);

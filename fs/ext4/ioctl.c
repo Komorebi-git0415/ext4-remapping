@@ -23,6 +23,7 @@
 #include <linux/uuid.h>
 #include "ext4_jbd2.h"
 #include "ext4.h"
+#include "brc.h"
 #include <linux/fsmap.h>
 #include "fsmap.h"
 #include <trace/events/ext4.h>
@@ -588,7 +589,7 @@ static int ext4_ioctl_setflags(struct inode *inode,
 {
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	handle_t *handle = NULL;
-	int err = -EPERM, migrate = 0;
+	int err = -EPERM, migrate = 0, brc_marker;
 	struct ext4_iloc iloc;
 	unsigned int oldflags, mask, i;
 	struct super_block *sb = inode->i_sb;
@@ -598,6 +599,25 @@ static int ext4_ioctl_setflags(struct inode *inode,
 		goto flags_out;
 
 	oldflags = ei->i_flags;
+
+        /*
+         * BRC-managed checkpoints must not escape the BRC lifecycle
+         * through the generic SETFLAGS path.  In particular, userspace
+         * must not be able to clear immutable on a sealed BRC inode.
+         *
+         * A future BRC_DELETE path will perform the controlled internal
+         * transition after lineage and block-liveness validation.
+         */
+        if ((oldflags & EXT4_IMMUTABLE_FL) &&
+            !(flags & EXT4_IMMUTABLE_FL)) {
+                brc_marker = ext4_brc_has_marker(inode);
+                if (brc_marker < 0) {
+                        err = brc_marker;
+                        goto flags_out;
+                }
+                if (brc_marker > 0)
+                        goto flags_out;
+        }
 	/*
 	 * The JOURNAL_DATA flag can only be changed by
 	 * the relevant capability.
@@ -1388,35 +1408,52 @@ out:
 }
 
 
-static long ext4_ioctl_brc_seal(struct file *file, unsigned long arg)
+static long ext4_ioctl_brc_seal(struct file *file,
+                                      unsigned long arg)
 {
-	struct ext4_brc_control control;
-	struct inode *inode = file_inode(file);
-	unsigned int i;
+        struct ext4_brc_control control;
+        struct inode *inode = file_inode(file);
+        struct mnt_idmap *idmap = file_mnt_idmap(file);
+        long ret;
+        unsigned int i;
 
-	if (copy_from_user(&control, (void __user *)arg, sizeof(control)))
-		return -EFAULT;
+        if (copy_from_user(&control, (void __user *)arg, sizeof(control)))
+                return -EFAULT;
 
-	if (control.flags)
-		return -EINVAL;
+        if (control.flags)
+                return -EINVAL;
 
-	for (i = 0; i < ARRAY_SIZE(control.reserved); i++) {
-		if (control.reserved[i])
-			return -EINVAL;
-	}
+        for (i = 0; i < ARRAY_SIZE(control.reserved); i++) {
+                if (control.reserved[i])
+                        return -EINVAL;
+        }
 
-	if (!S_ISREG(inode->i_mode))
-		return -EINVAL;
+        if (!S_ISREG(inode->i_mode))
+                return -EINVAL;
 
-	if (!(file->f_mode & FMODE_WRITE))
-		return -EBADF;
+        if (!(file->f_mode & FMODE_WRITE))
+                return -EBADF;
 
-	ext4_msg(inode->i_sb, KERN_INFO,
-		 "BRC_SEAL: inode=%lu", inode->i_ino);
+        if (!inode_owner_or_capable(idmap, inode))
+                return -EPERM;
 
-	return 0;
+        ret = mnt_want_write_file(file);
+        if (ret)
+                return ret;
+
+        inode_lock(inode);
+        ret = ext4_brc_seal_inode(inode);
+        inode_unlock(inode);
+
+        mnt_drop_write_file(file);
+
+        if (!ret)
+                ext4_msg(inode->i_sb, KERN_INFO,
+                         "BRC_SEAL: inode=%lu state=SEALED",
+                         inode->i_ino);
+
+        return ret;
 }
-
 static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);

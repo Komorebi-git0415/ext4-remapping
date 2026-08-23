@@ -41,6 +41,7 @@
 #define EXT4_IOC_BRC_TEST            _IO('f', 45)
 #define EXT4_IOC_BRC_CREATE		_IOW('f', 46, struct ext4_brc_create)
 #define EXT4_IOC_BRC_SEAL		_IOW('f', 47, struct ext4_brc_control)
+#define EXT4_IOC_BRC_SESSION_BEGIN _IO('f', 48)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 
@@ -93,17 +94,19 @@ struct fsuuid {
  * to the predecessor checkpoint in the same ext4 filesystem.
  */
 struct ext4_brc_create {
-	__s32 parent_fd;
-	__u32 flags;
-	__u32 reserved[4];
+        __s32 parent_fd;
+        __s32 session_fd;
+        __u32 flags;
+        __u32 reserved[3];
 };
 
 /*
  * Arguments for BRC checkpoint control operations.
  */
 struct ext4_brc_control {
-	__u32 flags;
-	__u32 reserved[5];
+        __s32 session_fd;
+        __u32 flags;
+        __u32 reserved[4];
 };
 
 /*

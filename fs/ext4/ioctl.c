@@ -1402,6 +1402,10 @@ static long ext4_ioctl_brc_create(struct file *file, unsigned long arg)
 	if (ret)
 		goto out;
 
+	ret = ext4_brc_prepare_child(file,
+	                             parent_file,
+	                             create.session_fd);
+
 out:
 	fdput(parent);
 	return ret;
@@ -1441,16 +1445,10 @@ static long ext4_ioctl_brc_seal(struct file *file,
         if (ret)
                 return ret;
 
-        inode_lock(inode);
-        ret = ext4_brc_seal_inode(inode);
-        inode_unlock(inode);
+        ret = ext4_brc_seal_with_session(file,
+                                         control.session_fd);
 
         mnt_drop_write_file(file);
-
-        if (!ret)
-                ext4_msg(inode->i_sb, KERN_INFO,
-                         "BRC_SEAL: inode=%lu state=SEALED",
-                         inode->i_ino);
 
         return ret;
 }
@@ -1463,6 +1461,11 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	ext4_debug("cmd = %u, arg = %lu\n", cmd, arg);
 
 	switch (cmd) {
+	case EXT4_IOC_BRC_SESSION_BEGIN:
+	        if (!S_ISDIR(inode->i_mode))
+	                return -ENOTDIR;
+	        return ext4_brc_session_begin(filp);
+
 	case EXT4_IOC_BRC_TEST:
 		ext4_msg(sb, KERN_INFO,
 			"BRC_TEST: inode=%lu size=%lld blocks=%llu",
@@ -1943,6 +1946,7 @@ long ext4_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case EXT4_IOC_BRC_TEST:
 	case EXT4_IOC_BRC_CREATE:
 	case EXT4_IOC_BRC_SEAL:
+	case EXT4_IOC_BRC_SESSION_BEGIN:
 		break;
 	default:
 		return -ENOIOCTLCMD;

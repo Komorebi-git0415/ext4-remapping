@@ -22,6 +22,8 @@
 
 #include "ext4.h"
 #include "ext4_jbd2.h"
+#include "ext4_extents.h"
+#include "extents_status.h"
 #include "xattr.h"
 #include "brc.h"
 
@@ -443,6 +445,286 @@ out_unlock:
 }
 
 
+/*
+ * Insert one already-existing physical range into the child's extent tree.
+ *
+ * The caller must hold child->i_data_sem for write.
+ *
+ * This operation deliberately does NOT allocate the shared data blocks:
+ * @pblk already belongs to a sealed predecessor and therefore remains
+ * allocated in the ext4 block bitmap.  Only the child's mapping metadata
+ * is added here.
+ *
+ * i_blocks is nevertheless increased for the child.  BRC presents each
+ * checkpoint inode as a complete logical file view even when some of its
+ * mapped data blocks are physically shared with another checkpoint.
+ */
+static int ext4_brc_insert_shared_extent(handle_t *handle,
+                                         struct inode *child,
+                                         ext4_lblk_t lblk,
+                                         ext4_fsblk_t pblk,
+                                         unsigned int len)
+{
+        struct ext4_ext_path *path;
+        struct ext4_extent newext = { 0 };
+        loff_t bytes;
+        int needed;
+        int ret;
+
+        if (!len || len > EXT_INIT_MAX_LEN)
+                return -EINVAL;
+
+        path = ext4_find_extent(child, lblk, NULL, 0);
+        if (IS_ERR(path))
+                return PTR_ERR(path);
+
+        /*
+         * Use ext4's own credit estimator.  ext4_ext_insert_extent()
+         * may need to split the tree and allocate extent metadata,
+         * even though BRC allocates no new shared data block.
+         */
+        needed = ext4_ext_calc_credits_for_single_extent(child,
+                                                         len,
+                                                         path);
+
+        ret = ext4_datasem_ensure_credits(handle, child,
+                                          needed, needed, 0);
+        if (ret) {
+                ext4_free_ext_path(path);
+                return ret;
+        }
+
+        newext.ee_block = cpu_to_le32(lblk);
+        newext.ee_len = cpu_to_le16(len);
+        ext4_ext_store_pblock(&newext, pblk);
+
+        path = ext4_ext_insert_extent(handle, child, path,
+                                      &newext, 0);
+        if (IS_ERR(path))
+                return PTR_ERR(path);
+
+        ext4_free_ext_path(path);
+
+        /*
+         * BRC i_blocks semantics:
+         *
+         * A shared block is still part of the complete block mapping
+         * presented by this inode.  Therefore it contributes to this
+         * inode's block accounting even though no second physical data
+         * block was allocated from the filesystem bitmap.
+         *
+         * Do not use dquot_alloc_block() here: no physical data-space
+         * allocation is taking place in this operation.
+         */
+        bytes = (loff_t)len << child->i_blkbits;
+        inode_add_bytes(child, bytes);
+
+        ret = ext4_mark_inode_dirty(handle, child);
+        if (ret)
+                return ret;
+
+        /*
+         * ext4_ext_insert_extent() modifies the on-disk extent tree
+         * directly.  It does not go through ext4_map_create_blocks(),
+         * so invalidate any stale HOLE entry in the ES cache.  A later
+         * normal lookup will repopulate the cache from the extent tree.
+         */
+        ext4_es_remove_extent(child, lblk, len);
+
+        return 0;
+}
+
+
+/*
+ * Fill the remaining holes of a BUILDING child from its sealed parent.
+ *
+ * Inheritance is defined by:
+ *
+ *     mapped(parent) intersection hole(child)
+ *
+ * Child mappings that already exist are private/dirty mappings and are
+ * never overwritten.  Parent holes remain holes in the child.
+ *
+ * Both inodes are immutable while shared mappings are visible:
+ * the parent was sealed previously, and the child is made immutable
+ * before this function is entered.
+ */
+static int ext4_brc_inherit_holes(struct inode *parent,
+                                  struct inode *child)
+{
+        struct super_block *sb = child->i_sb;
+        handle_t *handle;
+        ext4_lblk_t lblk = 0;
+        ext4_lblk_t total_blocks;
+        loff_t size;
+        u64 inherited_blocks = 0;
+        unsigned int inherited_ranges = 0;
+        int credits;
+        int ret = 0;
+        int stop_ret;
+
+        if (parent->i_sb != child->i_sb)
+                return -EXDEV;
+
+        if (!ext4_test_inode_flag(parent, EXT4_INODE_EXTENTS) ||
+            !ext4_test_inode_flag(child, EXT4_INODE_EXTENTS))
+                return -EOPNOTSUPP;
+
+        /*
+         * The first BRC remapping prototype intentionally excludes
+         * bigalloc.  Shared-block lifetime is defined at filesystem
+         * block granularity.
+         */
+        if (EXT4_SB(sb)->s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
+
+        /*
+         * BRC currently relies on the fixed-layout checkpoint invariant.
+         * Without layout_id, predecessor and child must expose the same
+         * logical byte length before inheritance is attempted.
+         */
+        size = i_size_read(child);
+        if (i_size_read(parent) != size)
+                return -EINVAL;
+
+        if (!size)
+                return 0;
+
+        total_blocks = (size + sb->s_blocksize - 1) >>
+                       sb->s_blocksize_bits;
+
+        /*
+         * Start with worst-case credits for one extent.  Inside the loop
+         * ext4_datasem_ensure_credits() extends/restarts the transaction
+         * using the actual child extent path, following ext4 migration's
+         * established insertion pattern.
+         */
+        credits = ext4_ext_calc_credits_for_single_extent(child, 1, NULL);
+        handle = ext4_journal_start(child, EXT4_HT_MAP_BLOCKS, credits);
+        if (IS_ERR(handle))
+                return PTR_ERR(handle);
+
+        if (IS_SYNC(child))
+                ext4_handle_sync(handle);
+
+        /*
+         * Parent mappings are stable because parent is already sealed
+         * and immutable.  Child is also immutable before this helper is
+         * called.  The data semaphores protect extent-tree traversal and
+         * modification itself.
+         */
+        down_read(&EXT4_I(parent)->i_data_sem);
+        down_write(&EXT4_I(child)->i_data_sem);
+
+        while (lblk < total_blocks) {
+                struct ext4_map_blocks cmap = {
+                        .m_lblk = lblk,
+                        .m_len = total_blocks - lblk,
+                };
+                struct ext4_map_blocks pmap = {
+                        .m_lblk = lblk,
+                };
+                ext4_lblk_t advance;
+                unsigned int inherit_len;
+                int mapped;
+
+                /*
+                 * Existing child mappings are the blocks materialized
+                 * while the checkpoint was BUILDING.  They win over the
+                 * predecessor and must never be replaced.
+                 */
+                mapped = ext4_ext_map_blocks(NULL, child, &cmap, 0);
+                if (mapped < 0) {
+                        ret = mapped;
+                        break;
+                }
+
+                if (mapped > 0) {
+                        if (cmap.m_flags & EXT4_MAP_UNWRITTEN) {
+                                ret = -EOPNOTSUPP;
+                                break;
+                        }
+
+                        lblk += mapped;
+                        continue;
+                }
+
+                if (!cmap.m_len) {
+                        ret = -EFSCORRUPTED;
+                        break;
+                }
+
+                /*
+                 * Only inspect the parent over the logical range that
+                 * is known to be a hole in the child.
+                 */
+                pmap.m_len = cmap.m_len;
+
+                mapped = ext4_ext_map_blocks(NULL, parent, &pmap, 0);
+                if (mapped < 0) {
+                        ret = mapped;
+                        break;
+                }
+
+                if (mapped == 0) {
+                        /*
+                         * A predecessor hole represents no physical data
+                         * block to inherit.  Preserve the hole and move
+                         * to the next mapping boundary.
+                         */
+                        if (!pmap.m_len) {
+                                ret = -EFSCORRUPTED;
+                                break;
+                        }
+
+                        advance = min_t(ext4_lblk_t,
+                                        cmap.m_len,
+                                        pmap.m_len);
+                        lblk += advance;
+                        continue;
+                }
+
+                if (pmap.m_flags & EXT4_MAP_UNWRITTEN) {
+                        ret = -EOPNOTSUPP;
+                        break;
+                }
+
+                inherit_len = min_t(unsigned int,
+                                    mapped,
+                                    cmap.m_len);
+
+                ret = ext4_brc_insert_shared_extent(handle,
+                                                    child,
+                                                    lblk,
+                                                    pmap.m_pblk,
+                                                    inherit_len);
+                if (ret)
+                        break;
+
+                inherited_blocks += inherit_len;
+                inherited_ranges++;
+                lblk += inherit_len;
+        }
+
+        up_write(&EXT4_I(child)->i_data_sem);
+        up_read(&EXT4_I(parent)->i_data_sem);
+
+        stop_ret = ext4_journal_stop(handle);
+        if (!ret)
+                ret = stop_ret;
+
+        if (!ret)
+                ext4_msg(sb, KERN_INFO,
+                         "BRC_INHERIT: parent_inode=%lu child_inode=%lu blocks=%llu ranges=%u",
+                         parent->i_ino,
+                         child->i_ino,
+                         (unsigned long long)inherited_blocks,
+                         inherited_ranges);
+
+        return ret;
+}
+
+
 int ext4_brc_seal_with_session(struct file *file,
                                int session_fd)
 {
@@ -562,10 +844,29 @@ int ext4_brc_seal_with_session(struct file *file,
         }
 
         /*
-         * Phase 3B-3 will insert clean parent mappings here,
-         * before the BUILDING -> SEALED transition.
+         * Establish the seal fence before any shared physical mapping
+         * becomes visible.
          *
-         * Phase 3B-2 deliberately performs no remapping.
+         * ext4_brc_set_immutable() first waits for direct I/O and writes
+         * dirty pages back.  This is required because a delayed-allocation
+         * dirty block must become a real child extent before we classify
+         * remaining holes as clean/inheritable.
+         *
+         * If inheritance later fails, the inode deliberately remains
+         * BUILDING + immutable.  A retry may continue filling its remaining
+         * holes, but userspace cannot modify an already-shared block.
+         */
+        ret = ext4_brc_set_immutable(inode);
+        if (ret)
+                goto out_inode;
+
+        ret = ext4_brc_inherit_holes(session->tail_inode, inode);
+        if (ret)
+                goto out_inode;
+
+        /*
+         * Only after the complete logical mapping has been materialized
+         * do we publish BUILDING -> SEALED.
          */
         meta.state = cpu_to_le16(EXT4_BRC_STATE_SEALED);
 
@@ -574,15 +875,6 @@ int ext4_brc_seal_with_session(struct file *file,
                                   XATTR_REPLACE);
         if (ret)
                 goto out_inode;
-
-        ret = ext4_brc_set_immutable(inode);
-        if (ret) {
-                meta.state = cpu_to_le16(EXT4_BRC_STATE_BUILDING);
-                ext4_brc_write_meta(inode,
-                                    &meta,
-                                    XATTR_REPLACE);
-                goto out_inode;
-        }
 
         old_tail = session->tail_inode;
 

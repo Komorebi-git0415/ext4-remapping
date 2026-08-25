@@ -42,6 +42,7 @@
 #define EXT4_IOC_BRC_CREATE		_IOW('f', 46, struct ext4_brc_create)
 #define EXT4_IOC_BRC_SEAL		_IOW('f', 47, struct ext4_brc_control)
 #define EXT4_IOC_BRC_SESSION_BEGIN _IO('f', 48)
+#define EXT4_IOC_BRC_LINEAGE_BEGIN _IO('f', 49)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 

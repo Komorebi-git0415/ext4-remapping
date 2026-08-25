@@ -29,6 +29,58 @@
 
 
 /*
+ * Persistent per-lineage metadata.
+ *
+ * Phase 4 separates checkpoint-local identity (trusted.brc) from
+ * persistent lineage ordering.  The lineage ledger is an ordinary
+ * BRC-managed ext4 regular file.
+ */
+#define EXT4_BRC_LINEAGE_MAGIC          0x314c5242U /* "BRL1" */
+#define EXT4_BRC_LINEAGE_VERSION        1
+
+/*
+ * Fixed 64-byte on-disk lineage header.
+ *
+ * tail_generation is derived once entries exist:
+ *
+ *   base_generation + nr_entries - 1
+ */
+struct ext4_brc_lineage_header_disk {
+        __le32 magic;
+        __le16 version;
+        __le16 header_size;
+
+        __le16 entry_size;
+        __le16 flags;
+        __le32 reserved0;
+
+        __le64 lineage_hi;
+        __le64 lineage_lo;
+
+        __le64 base_generation;
+        __le64 head_generation;
+        __le64 nr_entries;
+
+        __le64 reserved1;
+} __packed;
+
+
+/*
+ * Fixed 16-byte checkpoint reference.
+ *
+ * checkpoint_generation is not duplicated here.  For an uncompacted
+ * ledger it is derived from base_generation plus the entry index and
+ * is independently verified against trusted.brc when the inode is
+ * resolved.
+ */
+struct ext4_brc_lineage_entry_disk {
+        __le64 inode_number;
+        __le32 inode_generation;
+        __le32 flags;
+} __packed;
+
+
+/*
  * A live BRC session represents the capability to extend one
  * checkpoint inheritance lineage.
  *
@@ -41,6 +93,15 @@ struct ext4_brc_session {
          * of the anonymous session fd.
          */
         struct file *anchor_file;
+
+        /*
+         * Persistent lineage ledger associated with this session.
+         *
+         * This is NULL for the legacy Phase-3 SESSION_BEGIN path.
+         * For LINEAGE_BEGIN it aliases anchor_file; anchor_file owns
+         * the file reference.
+         */
+        struct file *lineage_file;
 
         /* Random 128-bit identity of this live lineage. */
         u8 lineage[16];
@@ -166,6 +227,127 @@ int ext4_brc_session_begin(struct file *anchor_file)
                  inode->i_ino, fd);
 
         return fd;
+}
+
+
+int ext4_brc_lineage_begin(struct file *lineage_file)
+{
+        struct inode *inode = file_inode(lineage_file);
+        struct ext4_brc_lineage_header_disk header;
+        struct ext4_brc_session *session;
+        loff_t pos = 0;
+        ssize_t written;
+        int fd;
+        int ret;
+
+        if (!S_ISREG(inode->i_mode))
+                return -EINVAL;
+
+        /*
+         * The Phase-4A prototype uses an ordinary empty ext4 file as
+         * the persistent lineage ledger.
+         */
+        if (!(lineage_file->f_mode & FMODE_READ) ||
+            !(lineage_file->f_mode & FMODE_WRITE))
+                return -EBADF;
+
+        if (i_size_read(inode) != 0)
+                return -EINVAL;
+
+        session = kzalloc(sizeof(*session), GFP_KERNEL);
+        if (!session)
+                return -ENOMEM;
+
+        /*
+         * Pin the ledger file, and therefore the ext4 mount, for the
+         * lifetime of the anonymous session fd.
+         */
+        get_file(lineage_file);
+        session->anchor_file = lineage_file;
+        session->lineage_file = lineage_file;
+
+        get_random_bytes(session->lineage,
+                         sizeof(session->lineage));
+
+        mutex_init(&session->lock);
+
+        session->generation = 0;
+        session->tail_inode = NULL;
+        session->building_inode = NULL;
+
+        memset(&header, 0, sizeof(header));
+
+        header.magic =
+                cpu_to_le32(EXT4_BRC_LINEAGE_MAGIC);
+        header.version =
+                cpu_to_le16(EXT4_BRC_LINEAGE_VERSION);
+        header.header_size =
+                cpu_to_le16((u16)sizeof(header));
+        header.entry_size =
+                cpu_to_le16(
+                        (u16)sizeof(struct ext4_brc_lineage_entry_disk));
+
+        /*
+         * lineage_hi/lo are an opaque persistent copy of the same
+         * 128-bit identity carried by trusted.brc checkpoints.
+         */
+        memcpy(&header.lineage_hi,
+               session->lineage,
+               sizeof(header.lineage_hi));
+        memcpy(&header.lineage_lo,
+               session->lineage + sizeof(header.lineage_hi),
+               sizeof(header.lineage_lo));
+
+        /*
+         * The ledger initially contains no checkpoint entries.
+         * Generation zero becomes real when the root checkpoint is
+         * successfully sealed and appended in the next Phase-4A step.
+         */
+        header.base_generation = cpu_to_le64(0);
+        header.head_generation = cpu_to_le64(0);
+        header.nr_entries = cpu_to_le64(0);
+
+        written = kernel_write(lineage_file,
+                               &header,
+                               sizeof(header),
+                               &pos);
+        if (written < 0) {
+                ret = (int)written;
+                goto out_session;
+        }
+
+        if (written != (ssize_t)sizeof(header)) {
+                ret = -EIO;
+                goto out_session;
+        }
+
+        /*
+         * Make the initial lineage object durable before publishing
+         * the anonymous session capability.
+         */
+        ret = vfs_fsync(lineage_file, 0);
+        if (ret)
+                goto out_session;
+
+        fd = anon_inode_getfd("[ext4-brc-lineage-session]",
+                              &ext4_brc_session_fops,
+                              session,
+                              O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+                ret = fd;
+                goto out_session;
+        }
+
+        ext4_msg(inode->i_sb, KERN_INFO,
+                 "BRC_LINEAGE_BEGIN: ledger_inode=%lu session_fd=%d",
+                 inode->i_ino, fd);
+
+        return fd;
+
+out_session:
+        fput(session->anchor_file);
+        kfree(session);
+        return ret;
 }
 
 

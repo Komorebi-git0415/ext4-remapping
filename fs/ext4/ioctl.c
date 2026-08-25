@@ -1461,6 +1461,9 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	ext4_debug("cmd = %u, arg = %lu\n", cmd, arg);
 
 	switch (cmd) {
+	case EXT4_IOC_BRC_LINEAGE_BEGIN:
+		return ext4_brc_lineage_begin(filp);
+
 	case EXT4_IOC_BRC_SESSION_BEGIN:
 	        if (!S_ISDIR(inode->i_mode))
 	                return -ENOTDIR;

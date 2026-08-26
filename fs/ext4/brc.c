@@ -511,6 +511,292 @@ static bool ext4_brc_same_lineage(struct ext4_brc_meta_disk *meta,
 }
 
 
+/*
+ * Read exactly @len bytes from a BRC-managed metadata file.
+ */
+static int ext4_brc_file_read_exact(struct file *file,
+                                    void *buf,
+                                    size_t len,
+                                    loff_t pos)
+{
+        u8 *p = buf;
+        size_t done = 0;
+
+        while (done < len) {
+                ssize_t ret;
+
+                ret = kernel_read(file,
+                                  p + done,
+                                  len - done,
+                                  &pos);
+                if (ret < 0)
+                        return ret;
+
+                if (!ret)
+                        return -EIO;
+
+                done += ret;
+        }
+
+        return 0;
+}
+
+
+/*
+ * Write exactly @len bytes to a BRC-managed metadata file.
+ */
+static int ext4_brc_file_write_exact(struct file *file,
+                                     const void *buf,
+                                     size_t len,
+                                     loff_t pos)
+{
+        const u8 *p = buf;
+        size_t done = 0;
+
+        while (done < len) {
+                ssize_t ret;
+
+                ret = kernel_write(file,
+                                   p + done,
+                                   len - done,
+                                   &pos);
+                if (ret < 0)
+                        return ret;
+
+                if (!ret)
+                        return -EIO;
+
+                done += ret;
+        }
+
+        return 0;
+}
+
+
+static int
+ext4_brc_lineage_validate_header(
+        struct ext4_brc_session *session,
+        const struct ext4_brc_lineage_header_disk *header)
+{
+        u64 base;
+        u64 head;
+        u64 nr_entries;
+        u64 tail;
+
+        if (le32_to_cpu(header->magic) !=
+            EXT4_BRC_LINEAGE_MAGIC)
+                return -EFSCORRUPTED;
+
+        if (le16_to_cpu(header->version) !=
+            EXT4_BRC_LINEAGE_VERSION)
+                return -EFSCORRUPTED;
+
+        if (le16_to_cpu(header->header_size) !=
+            sizeof(*header))
+                return -EFSCORRUPTED;
+
+        if (le16_to_cpu(header->entry_size) !=
+            sizeof(struct ext4_brc_lineage_entry_disk))
+                return -EFSCORRUPTED;
+
+        if (le16_to_cpu(header->flags) ||
+            le32_to_cpu(header->reserved0) ||
+            le64_to_cpu(header->reserved1))
+                return -EFSCORRUPTED;
+
+        /*
+         * The ledger and trusted.brc checkpoints must carry the
+         * same opaque 128-bit lineage identity.
+         */
+        if (memcmp(&header->lineage_hi,
+                   session->lineage,
+                   sizeof(header->lineage_hi)) ||
+            memcmp(&header->lineage_lo,
+                   session->lineage +
+                   sizeof(header->lineage_hi),
+                   sizeof(header->lineage_lo)))
+                return -EPERM;
+
+        base = le64_to_cpu(header->base_generation);
+        head = le64_to_cpu(header->head_generation);
+        nr_entries = le64_to_cpu(header->nr_entries);
+
+        if (!nr_entries) {
+                if (head != base)
+                        return -EFSCORRUPTED;
+                return 0;
+        }
+
+        /*
+         * Detect overflow before deriving the current tail.
+         */
+        tail = base + nr_entries - 1;
+        if (tail < base)
+                return -EFSCORRUPTED;
+
+        if (head < base || head > tail)
+                return -EFSCORRUPTED;
+
+        return 0;
+}
+
+
+/*
+ * Publish one sealed checkpoint into the persistent lineage ledger.
+ *
+ * The operation is idempotent for the current tail entry.  This is
+ * important because the checkpoint is deliberately marked SEALED
+ * before its lineage membership is published.  If publication returns
+ * an error, a later BRC_SEAL retry may safely attempt the same append.
+ *
+ * Publication order inside the ledger is:
+ *
+ *     entry contents -> fsync -> nr_entries -> fsync
+ *
+ * Thus nr_entries never intentionally exposes an entry whose contents
+ * have not first been made durable.
+ */
+static int
+ext4_brc_lineage_append_checkpoint(
+        struct ext4_brc_session *session,
+        struct inode *inode,
+        u64 checkpoint_generation)
+{
+        struct ext4_brc_lineage_header_disk header;
+        struct ext4_brc_lineage_entry_disk entry;
+        struct ext4_brc_lineage_entry_disk existing;
+        struct file *file = session->lineage_file;
+        u64 base;
+        u64 nr_entries;
+        u64 index;
+        __le64 new_nr_entries;
+        loff_t entry_pos;
+        loff_t count_pos;
+        int ret;
+
+        /*
+         * Preserve the verified Phase-3 interface.  Legacy sessions
+         * have no persistent lineage file and therefore perform no
+         * Phase-4A ledger update.
+         */
+        if (!file)
+                return 0;
+
+        ret = ext4_brc_file_read_exact(file,
+                                       &header,
+                                       sizeof(header),
+                                       0);
+        if (ret)
+                return ret;
+
+        ret = ext4_brc_lineage_validate_header(session,
+                                               &header);
+        if (ret)
+                return ret;
+
+        base = le64_to_cpu(header.base_generation);
+        nr_entries = le64_to_cpu(header.nr_entries);
+
+        if (checkpoint_generation < base)
+                return -EINVAL;
+
+        index = checkpoint_generation - base;
+
+        /*
+         * Linear inheritance permits no holes in the ordered ledger.
+         */
+        if (index > nr_entries)
+                return -EINVAL;
+
+        if (index < nr_entries) {
+                /*
+                 * Only the most recently published entry can be a
+                 * legitimate retry of the current seal operation.
+                 */
+                if (index + 1 != nr_entries)
+                        return -EEXIST;
+
+                entry_pos =
+                        sizeof(header) +
+                        index * sizeof(existing);
+
+                ret = ext4_brc_file_read_exact(file,
+                                               &existing,
+                                               sizeof(existing),
+                                               entry_pos);
+                if (ret)
+                        return ret;
+
+                if (le64_to_cpu(existing.inode_number) !=
+                    (u64)inode->i_ino ||
+                    le32_to_cpu(existing.inode_generation) !=
+                    inode->i_generation ||
+                    le32_to_cpu(existing.flags) != 0)
+                        return -EEXIST;
+
+                /*
+                 * The prior attempt may have returned from fsync with
+                 * an error even though the data ultimately reached
+                 * stable storage.  Re-fsync before declaring the retry
+                 * successful.
+                 */
+                return vfs_fsync(file, 0);
+        }
+
+        memset(&entry, 0, sizeof(entry));
+
+        entry.inode_number =
+                cpu_to_le64((u64)inode->i_ino);
+        entry.inode_generation =
+                cpu_to_le32(inode->i_generation);
+
+        entry_pos =
+                sizeof(header) +
+                index * sizeof(entry);
+
+        ret = ext4_brc_file_write_exact(file,
+                                        &entry,
+                                        sizeof(entry),
+                                        entry_pos);
+        if (ret)
+                return ret;
+
+        /*
+         * First make the entry durable.  Only then advance the
+         * published entry count in the header.
+         */
+        ret = vfs_fsync(file, 0);
+        if (ret)
+                return ret;
+
+        new_nr_entries = cpu_to_le64(nr_entries + 1);
+
+        count_pos = offsetof(
+                struct ext4_brc_lineage_header_disk,
+                nr_entries);
+
+        ret = ext4_brc_file_write_exact(file,
+                                        &new_nr_entries,
+                                        sizeof(new_nr_entries),
+                                        count_pos);
+        if (ret)
+                return ret;
+
+        ret = vfs_fsync(file, 0);
+        if (ret)
+                return ret;
+
+        ext4_msg(inode->i_sb, KERN_INFO,
+                 "BRC_LINEAGE_APPEND: ledger_inode=%lu checkpoint_inode=%lu generation=%llu nr_entries=%llu",
+                 file_inode(file)->i_ino,
+                 inode->i_ino,
+                 (unsigned long long)checkpoint_generation,
+                 (unsigned long long)(nr_entries + 1));
+
+        return 0;
+}
+
+
 int ext4_brc_prepare_child(struct file *child_file,
                            struct file *parent_file,
                            int session_fd)
@@ -937,18 +1223,72 @@ int ext4_brc_seal_with_session(struct file *file,
          * generation 0.
          */
         if (!session->tail_inode && !session->building_inode) {
-                ret = ext4_brc_has_marker(inode);
+                /*
+                 * A marker may already exist when a prior seal reached
+                 * the persistent SEALED state but ledger publication
+                 * returned an error.  Treat that state as a retryable
+                 * publication rather than permanently returning EEXIST.
+                 */
+                ret = ext4_brc_read_meta(inode, &meta);
                 if (ret < 0)
                         goto out_inode;
 
                 if (ret > 0) {
-                        ret = -EEXIST;
-                        goto out_inode;
-                }
+                        if (le16_to_cpu(meta.state) !=
+                            EXT4_BRC_STATE_SEALED) {
+                                ret = -EEXIST;
+                                goto out_inode;
+                        }
 
-                if (IS_IMMUTABLE(inode)) {
-                        ret = -EPERM;
-                        goto out_inode;
+                        if (!ext4_brc_same_lineage(&meta,
+                                                  session)) {
+                                ret = -EPERM;
+                                goto out_inode;
+                        }
+
+                        if (le64_to_cpu(meta.generation) != 0) {
+                                ret = -EINVAL;
+                                goto out_inode;
+                        }
+
+                        /*
+                         * Recover the rare partially completed root
+                         * transition where the SEALED identity reached
+                         * disk but the immutable fence did not.
+                         */
+                        if (!IS_IMMUTABLE(inode)) {
+                                ret = ext4_brc_set_immutable(inode);
+                                if (ret)
+                                        goto out_inode;
+                        }
+                } else {
+                        if (IS_IMMUTABLE(inode)) {
+                                ret = -EPERM;
+                                goto out_inode;
+                        }
+
+                        ext4_brc_meta_init(&meta,
+                                           session,
+                                           EXT4_BRC_STATE_SEALED,
+                                           0);
+
+                        ret = ext4_brc_write_meta(inode,
+                                                  &meta,
+                                                  XATTR_CREATE);
+                        if (ret)
+                                goto out_inode;
+
+                        ret = ext4_brc_set_immutable(inode);
+                        if (ret) {
+                                if (!IS_IMMUTABLE(inode))
+                                        ext4_xattr_set(
+                                            inode,
+                                            EXT4_XATTR_INDEX_TRUSTED,
+                                            EXT4_BRC_XATTR_NAME,
+                                            NULL, 0,
+                                            XATTR_REPLACE);
+                                goto out_inode;
+                        }
                 }
 
                 new_tail = igrab(inode);
@@ -957,28 +1297,18 @@ int ext4_brc_seal_with_session(struct file *file,
                         goto out_inode;
                 }
 
-                ext4_brc_meta_init(&meta,
-                                   session,
-                                   EXT4_BRC_STATE_SEALED,
-                                   0);
+                /*
+                 * The checkpoint is now SEALED + immutable, so it is
+                 * safe to drop its inode lock before writing the
+                 * independent regular-file ledger.  This avoids nested
+                 * checkpoint-inode -> ledger-inode write locking.
+                 */
+                inode_unlock(inode);
 
-                ret = ext4_brc_write_meta(inode,
-                                          &meta,
-                                          XATTR_CREATE);
+                ret = ext4_brc_lineage_append_checkpoint(
+                                session, inode, 0);
                 if (ret)
-                        goto out_put_new;
-
-                ret = ext4_brc_set_immutable(inode);
-                if (ret) {
-                        if (!IS_IMMUTABLE(inode))
-                                ext4_xattr_set(
-                                    inode,
-                                    EXT4_XATTR_INDEX_TRUSTED,
-                                    EXT4_BRC_XATTR_NAME,
-                                    NULL, 0,
-                                    XATTR_REPLACE);
-                        goto out_put_new;
-                }
+                        goto out_unlocked;
 
                 session->tail_inode = new_tail;
                 new_tail = NULL;
@@ -989,7 +1319,7 @@ int ext4_brc_seal_with_session(struct file *file,
                          inode->i_ino);
 
                 ret = 0;
-                goto out_inode;
+                goto out_unlocked;
         }
 
         /*
@@ -1009,11 +1339,6 @@ int ext4_brc_seal_with_session(struct file *file,
                 goto out_inode;
         }
 
-        if (le16_to_cpu(meta.state) != EXT4_BRC_STATE_BUILDING) {
-                ret = -EINVAL;
-                goto out_inode;
-        }
-
         if (!ext4_brc_same_lineage(&meta, session)) {
                 ret = -EPERM;
                 goto out_inode;
@@ -1021,6 +1346,36 @@ int ext4_brc_seal_with_session(struct file *file,
 
         if (le64_to_cpu(meta.generation) !=
             session->generation + 1) {
+                ret = -EINVAL;
+                goto out_inode;
+        }
+
+        /*
+         * If the checkpoint is already SEALED, a previous attempt
+         * reached the safe persistent checkpoint state but failed while
+         * publishing lineage membership.  Retry only that publication.
+         */
+        if (le16_to_cpu(meta.state) ==
+            EXT4_BRC_STATE_SEALED) {
+                if (!IS_IMMUTABLE(inode)) {
+                        ret = -EINVAL;
+                        goto out_inode;
+                }
+
+                inode_unlock(inode);
+
+                ret = ext4_brc_lineage_append_checkpoint(
+                                session,
+                                inode,
+                                session->generation + 1);
+                if (ret)
+                        goto out_unlocked;
+
+                goto publish_child;
+        }
+
+        if (le16_to_cpu(meta.state) !=
+            EXT4_BRC_STATE_BUILDING) {
                 ret = -EINVAL;
                 goto out_inode;
         }
@@ -1058,6 +1413,21 @@ int ext4_brc_seal_with_session(struct file *file,
         if (ret)
                 goto out_inode;
 
+        /*
+         * The data/mapping state is now SEALED + immutable.  Release
+         * this checkpoint inode before writing the independent lineage
+         * ledger file.
+         */
+        inode_unlock(inode);
+
+        ret = ext4_brc_lineage_append_checkpoint(
+                        session,
+                        inode,
+                        session->generation + 1);
+        if (ret)
+                goto out_unlocked;
+
+publish_child:
         old_tail = session->tail_inode;
 
         /*
@@ -1074,10 +1444,12 @@ int ext4_brc_seal_with_session(struct file *file,
                  (unsigned long long)session->generation);
 
         ret = 0;
+        goto out_unlocked;
 
 out_inode:
         inode_unlock(inode);
 
+out_unlocked:
         if (old_tail)
                 iput(old_tail);
 
@@ -1088,8 +1460,4 @@ out_inode:
         fdput(session_f);
         return ret;
 
-out_put_new:
-        iput(new_tail);
-        new_tail = NULL;
-        goto out_inode;
 }

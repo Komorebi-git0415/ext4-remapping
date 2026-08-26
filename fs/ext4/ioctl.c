@@ -1452,6 +1452,47 @@ static long ext4_ioctl_brc_seal(struct file *file,
 
         return ret;
 }
+static long ext4_ioctl_brc_reclaim_through(
+        struct file *file,
+        unsigned long arg)
+{
+        struct inode *inode = file_inode(file);
+        struct mnt_idmap *idmap = file_mnt_idmap(file);
+        struct ext4_brc_reclaim reclaim;
+        int ret;
+
+        if (copy_from_user(&reclaim,
+                           (void __user *)arg,
+                           sizeof(reclaim)))
+                return -EFAULT;
+
+        if (reclaim.flags || reclaim.reserved)
+                return -EINVAL;
+
+        if (!S_ISREG(inode->i_mode))
+                return -EINVAL;
+
+        if (!(file->f_mode & FMODE_READ) ||
+            !(file->f_mode & FMODE_WRITE))
+                return -EBADF;
+
+        if (!inode_owner_or_capable(idmap, inode))
+                return -EPERM;
+
+        ret = mnt_want_write_file(file);
+        if (ret)
+                return ret;
+
+        ret = ext4_brc_lineage_reclaim_through(
+                        file,
+                        reclaim.through_generation);
+
+        mnt_drop_write_file(file);
+
+        return ret;
+}
+
+
 static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
@@ -1461,6 +1502,9 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	ext4_debug("cmd = %u, arg = %lu\n", cmd, arg);
 
 	switch (cmd) {
+	case EXT4_IOC_BRC_RECLAIM_THROUGH:
+	        return ext4_ioctl_brc_reclaim_through(filp, arg);
+
 	case EXT4_IOC_BRC_LINEAGE_BEGIN:
 		return ext4_brc_lineage_begin(filp);
 

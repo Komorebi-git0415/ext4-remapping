@@ -81,6 +81,17 @@ struct ext4_brc_lineage_entry_disk {
 
 
 /*
+ * Phase-4 prototype serialization for persistent lineage metadata.
+ *
+ * A standalone reclamation ioctl can run without an ephemeral session,
+ * so it cannot use session->lock.  Serialize BRC-controlled ledger
+ * append and HEAD advancement here.  This is intentionally coarse
+ * grained for the research prototype and can later become per-ledger.
+ */
+static DEFINE_MUTEX(ext4_brc_lineage_io_mutex);
+
+
+/*
  * A live BRC session represents the capability to extend one
  * checkpoint inheritance lineage.
  *
@@ -574,8 +585,7 @@ static int ext4_brc_file_write_exact(struct file *file,
 
 
 static int
-ext4_brc_lineage_validate_header(
-        struct ext4_brc_session *session,
+ext4_brc_lineage_validate_header_format(
         const struct ext4_brc_lineage_header_disk *header)
 {
         u64 base;
@@ -604,19 +614,6 @@ ext4_brc_lineage_validate_header(
             le64_to_cpu(header->reserved1))
                 return -EFSCORRUPTED;
 
-        /*
-         * The ledger and trusted.brc checkpoints must carry the
-         * same opaque 128-bit lineage identity.
-         */
-        if (memcmp(&header->lineage_hi,
-                   session->lineage,
-                   sizeof(header->lineage_hi)) ||
-            memcmp(&header->lineage_lo,
-                   session->lineage +
-                   sizeof(header->lineage_hi),
-                   sizeof(header->lineage_lo)))
-                return -EPERM;
-
         base = le64_to_cpu(header->base_generation);
         head = le64_to_cpu(header->head_generation);
         nr_entries = le64_to_cpu(header->nr_entries);
@@ -628,7 +625,9 @@ ext4_brc_lineage_validate_header(
         }
 
         /*
-         * Detect overflow before deriving the current tail.
+         * tail_generation is derived rather than persisted:
+         *
+         *     tail = base + nr_entries - 1
          */
         tail = base + nr_entries - 1;
         if (tail < base)
@@ -640,6 +639,33 @@ ext4_brc_lineage_validate_header(
         return 0;
 }
 
+
+static int
+ext4_brc_lineage_validate_session_header(
+        struct ext4_brc_session *session,
+        const struct ext4_brc_lineage_header_disk *header)
+{
+        int ret;
+
+        ret = ext4_brc_lineage_validate_header_format(header);
+        if (ret)
+                return ret;
+
+        /*
+         * Session-driven append additionally requires the ledger to
+         * carry the same opaque 128-bit lineage identity.
+         */
+        if (memcmp(&header->lineage_hi,
+                   session->lineage,
+                   sizeof(header->lineage_hi)) ||
+            memcmp(&header->lineage_lo,
+                   session->lineage +
+                   sizeof(header->lineage_hi),
+                   sizeof(header->lineage_lo)))
+                return -EPERM;
+
+        return 0;
+}
 
 /*
  * Publish one sealed checkpoint into the persistent lineage ledger.
@@ -657,7 +683,7 @@ ext4_brc_lineage_validate_header(
  * have not first been made durable.
  */
 static int
-ext4_brc_lineage_append_checkpoint(
+__ext4_brc_lineage_append_checkpoint(
         struct ext4_brc_session *session,
         struct inode *inode,
         u64 checkpoint_generation)
@@ -689,7 +715,7 @@ ext4_brc_lineage_append_checkpoint(
         if (ret)
                 return ret;
 
-        ret = ext4_brc_lineage_validate_header(session,
+        ret = ext4_brc_lineage_validate_session_header(session,
                                                &header);
         if (ret)
                 return ret;
@@ -794,6 +820,171 @@ ext4_brc_lineage_append_checkpoint(
                  (unsigned long long)(nr_entries + 1));
 
         return 0;
+}
+
+
+static int
+ext4_brc_lineage_append_checkpoint(
+        struct ext4_brc_session *session,
+        struct inode *inode,
+        u64 checkpoint_generation)
+{
+        int ret;
+
+        /*
+         * Preserve the Phase-3 legacy session path.
+         */
+        if (!session->lineage_file)
+                return 0;
+
+        mutex_lock(&ext4_brc_lineage_io_mutex);
+
+        ret = __ext4_brc_lineage_append_checkpoint(
+                        session,
+                        inode,
+                        checkpoint_generation);
+
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+
+        return ret;
+}
+
+
+/*
+ * Advance the live-lineage frontier through @through_generation.
+ *
+ * Phase 4B-1 changes only head_generation:
+ *
+ *     BASE        unchanged
+ *     HEAD        through_generation + 1
+ *     nr_entries  unchanged
+ *
+ * The physical ledger entries are intentionally retained.  Their
+ * generation remains:
+ *
+ *     generation(entry[i]) = base_generation + i
+ *
+ * Actual checkpoint/block reclamation is added only after this
+ * persistent frontier transition has been independently verified.
+ */
+int ext4_brc_lineage_reclaim_through(
+        struct file *lineage_file,
+        u64 through_generation)
+{
+        struct inode *inode = file_inode(lineage_file);
+        struct ext4_brc_lineage_header_disk header;
+        __le64 new_head_disk;
+        u64 base;
+        u64 head;
+        u64 nr_entries;
+        u64 tail;
+        u64 new_head;
+        loff_t head_pos;
+        int ret;
+
+        if (!S_ISREG(inode->i_mode))
+                return -EINVAL;
+
+        if (!(lineage_file->f_mode & FMODE_READ) ||
+            !(lineage_file->f_mode & FMODE_WRITE))
+                return -EBADF;
+
+        /*
+         * Positional metadata updates must not be transformed into
+         * append writes by an O_APPEND file description.
+         */
+        if (lineage_file->f_flags & O_APPEND)
+                return -EINVAL;
+
+        mutex_lock(&ext4_brc_lineage_io_mutex);
+
+        ret = ext4_brc_file_read_exact(
+                        lineage_file,
+                        &header,
+                        sizeof(header),
+                        0);
+        if (ret)
+                goto out_unlock;
+
+        ret = ext4_brc_lineage_validate_header_format(
+                        &header);
+        if (ret)
+                goto out_unlock;
+
+        base = le64_to_cpu(header.base_generation);
+        head = le64_to_cpu(header.head_generation);
+        nr_entries = le64_to_cpu(header.nr_entries);
+
+        /*
+         * An empty ledger has no live checkpoint that can be retained
+         * as the post-reclamation HEAD.
+         */
+        if (!nr_entries) {
+                ret = -ENODATA;
+                goto out_unlock;
+        }
+
+        tail = base + nr_entries - 1;
+
+        /*
+         * Monotonic idempotence.  The requested prefix is already
+         * outside the live lineage.
+         *
+         * Re-fsync before reporting success: an earlier attempt may
+         * have updated the page cache and then returned an fsync error.
+         */
+        if (through_generation < head) {
+                ret = vfs_fsync(lineage_file, 0);
+                goto out_unlock;
+        }
+
+        /*
+         * Phase 4B RECLAIM_THROUGH always retains at least one live
+         * checkpoint.  Destroying the final tail is a separate future
+         * lineage-destruction operation.
+         */
+        if (through_generation >= tail) {
+                ret = -ERANGE;
+                goto out_unlock;
+        }
+
+        new_head = through_generation + 1;
+
+        /*
+         * BASE and nr_entries deliberately remain unchanged.
+         */
+        new_head_disk = cpu_to_le64(new_head);
+
+        head_pos = offsetof(
+                struct ext4_brc_lineage_header_disk,
+                head_generation);
+
+        ret = ext4_brc_file_write_exact(
+                        lineage_file,
+                        &new_head_disk,
+                        sizeof(new_head_disk),
+                        head_pos);
+        if (ret)
+                goto out_unlock;
+
+        ret = vfs_fsync(lineage_file, 0);
+        if (ret)
+                goto out_unlock;
+
+        ext4_msg(inode->i_sb, KERN_INFO,
+                 "BRC_RECLAIM_HEAD: ledger_inode=%lu old_head=%llu new_head=%llu tail=%llu base=%llu nr_entries=%llu",
+                 inode->i_ino,
+                 (unsigned long long)head,
+                 (unsigned long long)new_head,
+                 (unsigned long long)tail,
+                 (unsigned long long)base,
+                 (unsigned long long)nr_entries);
+
+        ret = 0;
+
+out_unlock:
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+        return ret;
 }
 
 

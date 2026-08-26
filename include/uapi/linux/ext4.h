@@ -43,6 +43,7 @@
 #define EXT4_IOC_BRC_SEAL		_IOW('f', 47, struct ext4_brc_control)
 #define EXT4_IOC_BRC_SESSION_BEGIN _IO('f', 48)
 #define EXT4_IOC_BRC_LINEAGE_BEGIN _IO('f', 49)
+#define EXT4_IOC_BRC_RECLAIM_THROUGH _IOW('f', 50, struct ext4_brc_reclaim)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 
@@ -86,6 +87,19 @@ struct fsuuid {
 	__u32       fsu_len;
 	__u32       fsu_flags;
 	__u8        fsu_uuid[];
+};
+
+/*
+ * Arguments for EXT4_IOC_BRC_RECLAIM_THROUGH.
+ *
+ * Phase 4B reclamation is monotonic-prefix only.  The operation
+ * advances the persistent live-lineage HEAD through the requested
+ * generation; it does not compact the ledger.
+ */
+struct ext4_brc_reclaim {
+        __u64 through_generation;
+        __u32 flags;
+        __u32 reserved;
 };
 
 /*

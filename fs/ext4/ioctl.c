@@ -1493,6 +1493,71 @@ static long ext4_ioctl_brc_reclaim_through(
 }
 
 
+static long ext4_ioctl_brc_classify_pair(
+        struct file *file,
+        unsigned long arg)
+{
+        struct inode *inode = file_inode(file);
+        struct mnt_idmap *idmap =
+                file_mnt_idmap(file);
+        struct ext4_brc_classify request;
+        struct ext4_brc_classify_stats stats;
+        int ret;
+
+        if (copy_from_user(
+                    &request,
+                    (void __user *)arg,
+                    sizeof(request)))
+                return -EFAULT;
+
+        if (request.flags ||
+            request.reserved)
+                return -EINVAL;
+
+        if (!S_ISREG(inode->i_mode))
+                return -EINVAL;
+
+        /*
+         * Phase 4C classification is read-only.  Unlike Phase 4B
+         * HEAD advancement, no writable file description or mount
+         * write reference is required here.
+         */
+        if (!(file->f_mode & FMODE_READ))
+                return -EBADF;
+
+        if (!inode_owner_or_capable(
+                    idmap,
+                    inode))
+                return -EPERM;
+
+        memset(&stats, 0, sizeof(stats));
+
+        ret = ext4_brc_lineage_classify_pair(
+                        file,
+                        request.generation,
+                        &stats);
+        if (ret)
+                return ret;
+
+        request.shared_blocks =
+                stats.shared_blocks;
+        request.dead_unique_blocks =
+                stats.dead_unique_blocks;
+        request.old_hole_blocks =
+                stats.old_hole_blocks;
+        request.compared_blocks =
+                stats.compared_blocks;
+
+        if (copy_to_user(
+                    (void __user *)arg,
+                    &request,
+                    sizeof(request)))
+                return -EFAULT;
+
+        return 0;
+}
+
+
 static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
@@ -1502,6 +1567,9 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	ext4_debug("cmd = %u, arg = %lu\n", cmd, arg);
 
 	switch (cmd) {
+	case EXT4_IOC_BRC_CLASSIFY_PAIR:
+	        return ext4_ioctl_brc_classify_pair(filp, arg);
+
 	case EXT4_IOC_BRC_RECLAIM_THROUGH:
 	        return ext4_ioctl_brc_reclaim_through(filp, arg);
 

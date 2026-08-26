@@ -988,6 +988,560 @@ out_unlock:
 }
 
 
+
+/*
+ * Read one fixed-size persistent checkpoint reference.
+ *
+ * entry[i] represents:
+ *
+ *     generation = base_generation + i
+ */
+static int ext4_brc_lineage_read_entry(
+        struct file *lineage_file,
+        u64 index,
+        struct ext4_brc_lineage_entry_disk *entry)
+{
+        loff_t pos;
+
+        pos = sizeof(struct ext4_brc_lineage_header_disk) +
+              index *
+              sizeof(struct ext4_brc_lineage_entry_disk);
+
+        return ext4_brc_file_read_exact(
+                        lineage_file,
+                        entry,
+                        sizeof(*entry),
+                        pos);
+}
+
+
+/*
+ * Resolve a persistent ledger reference and independently verify the
+ * complete BRC checkpoint identity.
+ *
+ * inode_number is insufficient by itself because the inode number may
+ * later be reused.  The stored i_generation must match exactly, after
+ * which trusted.brc is cross-checked against the persistent ledger.
+ */
+static struct inode *
+ext4_brc_resolve_checkpoint(
+        struct super_block *sb,
+        const struct ext4_brc_lineage_header_disk *header,
+        const struct ext4_brc_lineage_entry_disk *entry,
+        u64 expected_generation)
+{
+        struct ext4_brc_meta_disk meta;
+        struct inode *inode;
+        u64 ino;
+        int ret;
+
+        if (le32_to_cpu(entry->flags))
+                return ERR_PTR(-EFSCORRUPTED);
+
+        ino = le64_to_cpu(entry->inode_number);
+
+        /*
+         * Reject a persistent inode number that would be truncated on
+         * the current prototype architecture.
+         */
+        if ((u64)(unsigned long)ino != ino)
+                return ERR_PTR(-ESTALE);
+
+        inode = ext4_iget(
+                        sb,
+                        (unsigned long)ino,
+                        EXT4_IGET_HANDLE);
+        if (IS_ERR(inode))
+                return inode;
+
+        /*
+         * Unlike the generic NFS helper, generation zero is not a
+         * wildcard.  BRC records an exact inode incarnation.
+         */
+        if (inode->i_generation !=
+            le32_to_cpu(entry->inode_generation)) {
+                iput(inode);
+                return ERR_PTR(-ESTALE);
+        }
+
+        if (!S_ISREG(inode->i_mode) ||
+            !IS_IMMUTABLE(inode)) {
+                iput(inode);
+                return ERR_PTR(-EFSCORRUPTED);
+        }
+
+        ret = ext4_brc_read_meta(inode, &meta);
+        if (ret <= 0) {
+                iput(inode);
+
+                if (ret < 0)
+                        return ERR_PTR(ret);
+
+                return ERR_PTR(-EFSCORRUPTED);
+        }
+
+        if (le32_to_cpu(meta.magic) !=
+            EXT4_BRC_META_MAGIC ||
+            le16_to_cpu(meta.version) !=
+            EXT4_BRC_META_VERSION ||
+            le16_to_cpu(meta.state) !=
+            EXT4_BRC_STATE_SEALED ||
+            le64_to_cpu(meta.reserved)) {
+                iput(inode);
+                return ERR_PTR(-EFSCORRUPTED);
+        }
+
+        if (memcmp(&meta.lineage_hi,
+                   &header->lineage_hi,
+                   sizeof(meta.lineage_hi)) ||
+            memcmp(&meta.lineage_lo,
+                   &header->lineage_lo,
+                   sizeof(meta.lineage_lo))) {
+                iput(inode);
+                return ERR_PTR(-EFSCORRUPTED);
+        }
+
+        if (le64_to_cpu(meta.generation) !=
+            expected_generation) {
+                iput(inode);
+                return ERR_PTR(-EFSCORRUPTED);
+        }
+
+        return inode;
+}
+
+
+/*
+ * Classify physical-block liveness between two verified adjacent
+ * SEALED checkpoints:
+ *
+ *     old = Cg
+ *     successor = Cg+1
+ *
+ * Both checkpoints are already ledger-published.  A BUILDING child
+ * can therefore never reach this function as the successor.
+ *
+ * Classification:
+ *
+ *   old HOLE
+ *       -> OLD_HOLE
+ *
+ *   old MAPPED(P), successor MAPPED(P)
+ *       -> SHARED_LIVE
+ *
+ *   old MAPPED(P), successor MAPPED(Q), P != Q
+ *       -> DEAD_UNIQUE
+ *
+ *   old MAPPED, successor HOLE
+ *       -> EFSCORRUPTED
+ *
+ * The last case is corruption only because the successor has already
+ * completed BRC inheritance, reached SEALED state, and been published
+ * into the persistent ledger.  The same observation against a
+ * BUILDING child would be a legal intermediate construction state.
+ *
+ * Traversal follows mapping boundaries, as already done by
+ * ext4_brc_inherit_holes(), rather than performing one lookup for
+ * every individual logical block.
+ */
+static int ext4_brc_classify_inode_pair(
+        struct inode *old_inode,
+        struct inode *successor_inode,
+        struct ext4_brc_classify_stats *stats)
+{
+        struct super_block *sb = old_inode->i_sb;
+        ext4_lblk_t lblk = 0;
+        ext4_lblk_t total_blocks;
+        loff_t size;
+        int ret = 0;
+
+        memset(stats, 0, sizeof(*stats));
+
+        if (successor_inode->i_sb != sb)
+                return -EXDEV;
+
+        if (!ext4_test_inode_flag(
+                    old_inode,
+                    EXT4_INODE_EXTENTS) ||
+            !ext4_test_inode_flag(
+                    successor_inode,
+                    EXT4_INODE_EXTENTS))
+                return -EOPNOTSUPP;
+
+        /*
+         * Current BRC physical lifetime semantics operate at normal
+         * ext4 filesystem-block granularity.
+         */
+        if (EXT4_SB(sb)->s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
+
+        size = i_size_read(old_inode);
+
+        /*
+         * BRC currently uses the fixed-layout checkpoint invariant.
+         */
+        if (i_size_read(successor_inode) != size)
+                return -EFSCORRUPTED;
+
+        if (!size)
+                return 0;
+
+        total_blocks =
+                (size + sb->s_blocksize - 1) >>
+                sb->s_blocksize_bits;
+
+        /*
+         * SEALED checkpoints are immutable.  Hold read locks over
+         * both extent trees while taking the classification snapshot.
+         */
+        down_read(&EXT4_I(old_inode)->i_data_sem);
+        down_read(&EXT4_I(successor_inode)->i_data_sem);
+
+        while (lblk < total_blocks) {
+                struct ext4_map_blocks old_map = {
+                        .m_lblk = lblk,
+                        .m_len = total_blocks - lblk,
+                };
+                struct ext4_map_blocks successor_map = {
+                        .m_lblk = lblk,
+                        .m_len = total_blocks - lblk,
+                };
+                unsigned int old_len;
+                unsigned int successor_len;
+                unsigned int advance;
+                int old_mapped;
+                int successor_mapped;
+
+                old_mapped = ext4_ext_map_blocks(
+                                NULL,
+                                old_inode,
+                                &old_map,
+                                0);
+                if (old_mapped < 0) {
+                        ret = old_mapped;
+                        break;
+                }
+
+                successor_mapped = ext4_ext_map_blocks(
+                                NULL,
+                                successor_inode,
+                                &successor_map,
+                                0);
+                if (successor_mapped < 0) {
+                        ret = successor_mapped;
+                        break;
+                }
+
+                if (old_mapped > 0 &&
+                    (old_map.m_flags &
+                     EXT4_MAP_UNWRITTEN)) {
+                        ret = -EOPNOTSUPP;
+                        break;
+                }
+
+                if (successor_mapped > 0 &&
+                    (successor_map.m_flags &
+                     EXT4_MAP_UNWRITTEN)) {
+                        ret = -EOPNOTSUPP;
+                        break;
+                }
+
+                old_len = old_mapped > 0 ?
+                          (unsigned int)old_mapped :
+                          old_map.m_len;
+
+                successor_len =
+                        successor_mapped > 0 ?
+                        (unsigned int)successor_mapped :
+                        successor_map.m_len;
+
+                if (!old_len || !successor_len) {
+                        ret = -EFSCORRUPTED;
+                        break;
+                }
+
+                advance = min(old_len,
+                              successor_len);
+
+                if (!old_mapped) {
+                        /*
+                         * The retired checkpoint owns no physical
+                         * block over this range.  Whether the
+                         * successor remains a hole or materializes
+                         * private data does not create reclaimable
+                         * predecessor storage.
+                         */
+                        stats->old_hole_blocks += advance;
+                } else if (!successor_mapped) {
+                        /*
+                         * This is illegal only for the verified
+                         * SEALED + ledger-published adjacent pair
+                         * accepted by the outer classifier.
+                         *
+                         * A BUILDING successor is intentionally never
+                         * admitted here.
+                         */
+                        ret = -EFSCORRUPTED;
+                        break;
+                } else if (old_map.m_pblk ==
+                           successor_map.m_pblk) {
+                        /*
+                         * The successor still references exactly the
+                         * same predecessor physical storage.
+                         */
+                        stats->shared_blocks += advance;
+                } else {
+                        /*
+                         * The successor has replaced this logical
+                         * range with different physical storage.
+                         *
+                         * Under linear inheritance, once the direct
+                         * successor no longer carries this old pblk,
+                         * no downstream checkpoint can reacquire it
+                         * by skipping backwards in the lineage.
+                         */
+                        stats->dead_unique_blocks += advance;
+                }
+
+                stats->compared_blocks += advance;
+                lblk += advance;
+        }
+
+        up_read(&EXT4_I(successor_inode)->i_data_sem);
+        up_read(&EXT4_I(old_inode)->i_data_sem);
+
+        if (ret)
+                return ret;
+
+        if (stats->shared_blocks +
+            stats->dead_unique_blocks +
+            stats->old_hole_blocks !=
+            stats->compared_blocks)
+                return -EFSCORRUPTED;
+
+        if (stats->compared_blocks !=
+            (u64)total_blocks)
+                return -EFSCORRUPTED;
+
+        return 0;
+}
+
+
+/*
+ * Phase 4C read-only adjacent-checkpoint liveness classifier.
+ *
+ * Persistent lineage state:
+ *
+ *     [base, head - 1]  logically retired
+ *     [head, tail]      live
+ *
+ * Only:
+ *
+ *     base <= generation < head
+ *
+ * may be classified.
+ *
+ * Consequently the old checkpoint can never be the current persistent
+ * tail.  Its successor is guaranteed to exist in the ledger and may
+ * itself be the tail.
+ *
+ * This distinction also protects checkpoint construction.  If a live
+ * session is currently building C(T+1), the persistent tail CT remains
+ * the complete immutable inheritance source for that BUILDING child.
+ * CT is outside the reclamation/classification domain as an old
+ * checkpoint.
+ *
+ * Phase 5 will separately handle promotion and final lineage teardown.
+ * Tail destruction belongs to that later finalization path and is
+ * legal only after the session has ended and no future child can be
+ * created.
+ */
+int ext4_brc_lineage_classify_pair(
+        struct file *lineage_file,
+        u64 generation,
+        struct ext4_brc_classify_stats *stats)
+{
+        struct inode *ledger_inode =
+                file_inode(lineage_file);
+        struct super_block *sb =
+                ledger_inode->i_sb;
+        struct ext4_brc_lineage_header_disk header;
+        struct ext4_brc_lineage_entry_disk old_entry;
+        struct ext4_brc_lineage_entry_disk successor_entry;
+        struct inode *old_inode = NULL;
+        struct inode *successor_inode = NULL;
+        u64 base;
+        u64 head;
+        u64 nr_entries;
+        u64 tail;
+        u64 index;
+        bool successor_is_tail;
+        int ret;
+
+        if (!S_ISREG(ledger_inode->i_mode))
+                return -EINVAL;
+
+        if (!(lineage_file->f_mode & FMODE_READ))
+                return -EBADF;
+
+        if (!stats)
+                return -EINVAL;
+
+        /*
+         * Snapshot persistent lineage control fields and the two
+         * immutable entry references under BRC ledger serialization.
+         */
+        mutex_lock(&ext4_brc_lineage_io_mutex);
+
+        ret = ext4_brc_file_read_exact(
+                        lineage_file,
+                        &header,
+                        sizeof(header),
+                        0);
+        if (ret)
+                goto out_ledger_unlock;
+
+        ret = ext4_brc_lineage_validate_header_format(
+                        &header);
+        if (ret)
+                goto out_ledger_unlock;
+
+        base = le64_to_cpu(
+                        header.base_generation);
+        head = le64_to_cpu(
+                        header.head_generation);
+        nr_entries = le64_to_cpu(
+                        header.nr_entries);
+
+        if (!nr_entries) {
+                ret = -ENODATA;
+                goto out_ledger_unlock;
+        }
+
+        /*
+         * Header validation has already proved this derivation does
+         * not wrap and that:
+         *
+         *     base <= head <= tail
+         */
+        tail = base + nr_entries - 1;
+
+        /*
+         * An old checkpoint must have a persistent direct successor.
+         *
+         * In particular:
+         *
+         *     generation == tail
+         *
+         * is a range error, not filesystem corruption.
+         *
+         * This rule also keeps a tail that is currently parenting a
+         * BUILDING child completely outside the reclamation domain.
+         */
+        if (generation >= tail) {
+                ret = -ERANGE;
+                goto out_ledger_unlock;
+        }
+
+        /*
+         * Phase 4C inference is driven only by the retired prefix
+         * established persistently by Phase 4B.
+         */
+        if (generation < base ||
+            generation >= head) {
+                ret = -ERANGE;
+                goto out_ledger_unlock;
+        }
+
+        index = generation - base;
+
+        ret = ext4_brc_lineage_read_entry(
+                        lineage_file,
+                        index,
+                        &old_entry);
+        if (ret)
+                goto out_ledger_unlock;
+
+        ret = ext4_brc_lineage_read_entry(
+                        lineage_file,
+                        index + 1,
+                        &successor_entry);
+        if (ret)
+                goto out_ledger_unlock;
+
+        successor_is_tail =
+                generation + 1 == tail;
+
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+
+        old_inode = ext4_brc_resolve_checkpoint(
+                        sb,
+                        &header,
+                        &old_entry,
+                        generation);
+        if (IS_ERR(old_inode))
+                return PTR_ERR(old_inode);
+
+        successor_inode =
+                ext4_brc_resolve_checkpoint(
+                        sb,
+                        &header,
+                        &successor_entry,
+                        generation + 1);
+        if (IS_ERR(successor_inode)) {
+                ret = PTR_ERR(successor_inode);
+                successor_inode = NULL;
+                goto out_put;
+        }
+
+        if (old_inode == successor_inode) {
+                ret = -EFSCORRUPTED;
+                goto out_put;
+        }
+
+        ret = ext4_brc_classify_inode_pair(
+                        old_inode,
+                        successor_inode,
+                        stats);
+        if (ret)
+                goto out_put;
+
+        ext4_msg(
+                sb,
+                KERN_INFO,
+                "BRC_CLASSIFY: ledger_inode=%lu generation=%llu successor=%llu successor_is_tail=%u old_inode=%lu successor_inode=%lu shared=%llu dead_unique=%llu old_holes=%llu compared=%llu",
+                ledger_inode->i_ino,
+                (unsigned long long)generation,
+                (unsigned long long)(generation + 1),
+                successor_is_tail ? 1 : 0,
+                old_inode->i_ino,
+                successor_inode->i_ino,
+                (unsigned long long)
+                        stats->shared_blocks,
+                (unsigned long long)
+                        stats->dead_unique_blocks,
+                (unsigned long long)
+                        stats->old_hole_blocks,
+                (unsigned long long)
+                        stats->compared_blocks);
+
+        ret = 0;
+
+out_put:
+        if (successor_inode)
+                iput(successor_inode);
+
+        if (old_inode)
+                iput(old_inode);
+
+        return ret;
+
+out_ledger_unlock:
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+        return ret;
+}
+
+
 int ext4_brc_prepare_child(struct file *child_file,
                            struct file *parent_file,
                            int session_fd)

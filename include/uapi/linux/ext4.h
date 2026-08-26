@@ -44,6 +44,7 @@
 #define EXT4_IOC_BRC_SESSION_BEGIN _IO('f', 48)
 #define EXT4_IOC_BRC_LINEAGE_BEGIN _IO('f', 49)
 #define EXT4_IOC_BRC_RECLAIM_THROUGH _IOW('f', 50, struct ext4_brc_reclaim)
+#define EXT4_IOC_BRC_CLASSIFY_PAIR _IOWR('f', 51, struct ext4_brc_classify)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 
@@ -87,6 +88,38 @@ struct fsuuid {
 	__u32       fsu_len;
 	__u32       fsu_flags;
 	__u8        fsu_uuid[];
+};
+
+/*
+ * Arguments/results for EXT4_IOC_BRC_CLASSIFY_PAIR.
+ *
+ * generation identifies the retired checkpoint Cg.  The kernel
+ * compares Cg only with its persistent direct successor Cg+1.
+ *
+ * Legal domain:
+ *
+ *     base_generation <= generation < head_generation
+ *
+ * Therefore Cg is retired and cannot be the persistent tail.
+ * Cg+1 may itself be the tail.
+ *
+ * BUILDING checkpoints are not ledger-published and therefore never
+ * participate in this classifier.
+ *
+ * This ioctl is strictly read-only.  It does not modify the lineage
+ * ledger, either checkpoint mapping, inode accounting, or allocation
+ * bitmap.
+ */
+struct ext4_brc_classify {
+        __u64 generation;
+
+        __u64 shared_blocks;
+        __u64 dead_unique_blocks;
+        __u64 old_hole_blocks;
+        __u64 compared_blocks;
+
+        __u32 flags;
+        __u32 reserved;
 };
 
 /*

@@ -5,6 +5,18 @@
 struct inode;
 struct file;
 
+struct ext4_brc_classify_stats {
+        u64 shared_blocks;
+        u64 dead_unique_blocks;
+        u64 old_hole_blocks;
+        u64 compared_blocks;
+};
+
+int ext4_brc_lineage_classify_pair(
+        struct file *lineage_file,
+        u64 generation,
+        struct ext4_brc_classify_stats *stats);
+
 int ext4_brc_lineage_begin(struct file *lineage_file);
 int ext4_brc_lineage_reclaim_through(struct file *lineage_file,
                                      u64 through_generation);

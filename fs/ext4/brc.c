@@ -39,6 +39,25 @@
 #define EXT4_BRC_LINEAGE_VERSION        1
 
 /*
+ * Version-1 lineage header feature flags.
+ *
+ * Old Phase-4A/4B ledgers have flags == 0 and reserved1 == 0.
+ * Such a ledger is interpreted as having an implicit physical
+ * reclamation cursor:
+ *
+ *     reclaim_generation == base_generation
+ *
+ * Once physical reclamation advances beyond BASE, the cursor feature
+ * is made explicit and the final 64-bit header field stores R.
+ *
+ * An older kernel does not recognize this flag and therefore fails
+ * closed instead of operating on a physically modified lineage.
+ */
+#define EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR       0x0001
+#define EXT4_BRC_LINEAGE_KNOWN_FLAGS            \
+        EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR
+
+/*
  * Fixed 64-byte on-disk lineage header.
  *
  * tail_generation is derived once entries exist:
@@ -61,7 +80,14 @@ struct ext4_brc_lineage_header_disk {
         __le64 head_generation;
         __le64 nr_entries;
 
-        __le64 reserved1;
+        /*
+         * flags == 0:
+         *     must be zero; R is implicitly base_generation.
+         *
+         * EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR:
+         *     stores persistent reclaim_generation R.
+         */
+        __le64 reclaim_generation;
 } __packed;
 
 
@@ -78,6 +104,32 @@ struct ext4_brc_lineage_entry_disk {
         __le32 inode_generation;
         __le32 flags;
 } __packed;
+
+
+/*
+ * Decode the oldest checkpoint whose physical reclamation is not yet
+ * complete.
+ *
+ * Legacy Phase-4A/4B ledgers did not persist R.  Their zero flags and
+ * zero final header field are interpreted as:
+ *
+ *     R = BASE
+ *
+ * This preserves the existing 64-byte version-1 on-disk layout while
+ * allowing Phase 4C to make R persistent once it actually advances.
+ */
+static u64 ext4_brc_lineage_reclaim_generation(
+        const struct ext4_brc_lineage_header_disk *header)
+{
+        u16 flags = le16_to_cpu(header->flags);
+
+        if (flags & EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR)
+                return le64_to_cpu(
+                        header->reclaim_generation);
+
+        return le64_to_cpu(
+                header->base_generation);
+}
 
 
 /*
@@ -588,7 +640,9 @@ static int
 ext4_brc_lineage_validate_header_format(
         const struct ext4_brc_lineage_header_disk *header)
 {
+        u16 flags;
         u64 base;
+        u64 reclaim_generation;
         u64 head;
         u64 nr_entries;
         u64 tail;
@@ -609,18 +663,40 @@ ext4_brc_lineage_validate_header_format(
             sizeof(struct ext4_brc_lineage_entry_disk))
                 return -EFSCORRUPTED;
 
-        if (le16_to_cpu(header->flags) ||
-            le32_to_cpu(header->reserved0) ||
-            le64_to_cpu(header->reserved1))
+        flags = le16_to_cpu(header->flags);
+
+        if (flags & ~EXT4_BRC_LINEAGE_KNOWN_FLAGS)
+                return -EFSCORRUPTED;
+
+        if (le32_to_cpu(header->reserved0))
+                return -EFSCORRUPTED;
+
+        /*
+         * Legacy version-1 ledgers have no explicit reclaim cursor.
+         * Their final header field must remain zero and R is inferred
+         * to equal BASE.
+         */
+        if (!(flags &
+              EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR) &&
+            le64_to_cpu(header->reclaim_generation))
                 return -EFSCORRUPTED;
 
         base = le64_to_cpu(header->base_generation);
+        reclaim_generation =
+                ext4_brc_lineage_reclaim_generation(header);
         head = le64_to_cpu(header->head_generation);
         nr_entries = le64_to_cpu(header->nr_entries);
 
         if (!nr_entries) {
-                if (head != base)
+                /*
+                 * Empty lineage:
+                 *
+                 *     B = R = H
+                 */
+                if (head != base ||
+                    reclaim_generation != base)
                         return -EFSCORRUPTED;
+
                 return 0;
         }
 
@@ -633,7 +709,16 @@ ext4_brc_lineage_validate_header_format(
         if (tail < base)
                 return -EFSCORRUPTED;
 
+        /*
+         * Phase-4C persistent lineage invariant:
+         *
+         *     B <= R <= H <= T
+         */
         if (head < base || head > tail)
+                return -EFSCORRUPTED;
+
+        if (reclaim_generation < base ||
+            reclaim_generation > head)
                 return -EFSCORRUPTED;
 
         return 0;
@@ -1332,12 +1417,18 @@ static int ext4_brc_classify_inode_pair(
  *
  * Persistent lineage state:
  *
- *     [base, head - 1]  logically retired
- *     [head, tail]      live
+ *     [base, reclaim_generation - 1]
+ *             already physically reclaimed
+ *
+ *     [reclaim_generation, head - 1]
+ *             logically retired, physically intact/pending
+ *
+ *     [head, tail]
+ *             live
  *
  * Only:
  *
- *     base <= generation < head
+ *     reclaim_generation <= generation < head
  *
  * may be classified.
  *
@@ -1371,6 +1462,7 @@ int ext4_brc_lineage_classify_pair(
         struct inode *old_inode = NULL;
         struct inode *successor_inode = NULL;
         u64 base;
+        u64 reclaim_generation;
         u64 head;
         u64 nr_entries;
         u64 tail;
@@ -1408,6 +1500,9 @@ int ext4_brc_lineage_classify_pair(
 
         base = le64_to_cpu(
                         header.base_generation);
+        reclaim_generation =
+                ext4_brc_lineage_reclaim_generation(
+                        &header);
         head = le64_to_cpu(
                         header.head_generation);
         nr_entries = le64_to_cpu(
@@ -1444,10 +1539,14 @@ int ext4_brc_lineage_classify_pair(
         }
 
         /*
-         * Phase 4C inference is driven only by the retired prefix
-         * established persistently by Phase 4B.
+         * Phase 4C inference is valid only while the retired
+         * predecessor still has its original physical mappings.
+         *
+         * Once generation < R, physical reclamation has already
+         * consumed that checkpoint and its remaining extent tree can
+         * no longer be treated as the original mapping snapshot.
          */
-        if (generation < base ||
+        if (generation < reclaim_generation ||
             generation >= head) {
                 ret = -ERANGE;
                 goto out_ledger_unlock;

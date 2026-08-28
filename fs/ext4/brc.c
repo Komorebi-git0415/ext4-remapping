@@ -10,6 +10,7 @@
  * No extent sharing is implemented in this phase.
  */
 
+#include <linux/moduleparam.h>
 #include <linux/fs.h>
 #include <linux/anon_inodes.h>
 #include <linux/file.h>
@@ -1626,6 +1627,46 @@ out:
  * Reclamation is strictly right-to-left.  After every mutation the next
  * loop iteration performs a fresh CURRENT-rightmost lookup.
  */
+/*
+ * Deterministic crash injection for BRC crash/restart validation.
+ *
+ * 0 = disabled
+ * 1 = after one successful destructive suffix-range mutation
+ * 2 = after the whole destructive pair pass, before ext4_force_commit()
+ * 3 = after ext4_force_commit(), before persistent R publication
+ *
+ * Research/test-only facility.  Default is disabled.
+ */
+static int ext4_brc_test_crash_point;
+
+module_param_named(brc_test_crash_point,
+                   ext4_brc_test_crash_point,
+                   int, 0644);
+
+MODULE_PARM_DESC(brc_test_crash_point,
+                 "BRC deterministic crash point (0=off,1=mid-pass,2=pre-commit,3=post-commit-pre-R)");
+
+static void
+ext4_brc_test_maybe_crash(struct super_block *sb, int point)
+{
+        if (READ_ONCE(ext4_brc_test_crash_point) != point)
+                return;
+
+        /*
+         * Make the injection one-shot for the current boot in case the
+         * panic path is intercepted by an experimental environment.
+         * A real reboot also resets the parameter to its default 0.
+         */
+        WRITE_ONCE(ext4_brc_test_crash_point, 0);
+
+        ext4_msg(sb, KERN_EMERG,
+                 "BRC_TEST_CRASH: deterministic crash point=%d",
+                 point);
+
+        panic("EXT4 BRC deterministic crash point %d", point);
+}
+
+
 static int ext4_brc_reclaim_inode_pair(
         struct inode *old_inode,
         struct inode *successor_inode,
@@ -1727,6 +1768,14 @@ static int ext4_brc_reclaim_inode_pair(
                         dead_done += len;
                 else
                         shared_done += len;
+
+                /*
+                 * Crash point 1: at least one CURRENT-rightmost
+                 * destructive suffix range has completed, while R is
+                 * still unchanged.
+                 */
+                ext4_brc_test_maybe_crash(
+                        old_inode->i_sb, 1);
 
                 cond_resched();
         }
@@ -2092,6 +2141,13 @@ int ext4_brc_lineage_reclaim_physical_next(
                 goto out_put;
 
         /*
+         * Crash point 2: the destructive pair pass is complete, but no
+         * explicit filesystem-wide journal commit has been requested
+         * yet.  R is still unchanged.
+         */
+        ext4_brc_test_maybe_crash(sb, 2);
+
+        /*
          * Every individual extent mutation has completed its ext4
          * transaction, but R must not advance until those filesystem
          * metadata changes are durably committed.
@@ -2099,6 +2155,13 @@ int ext4_brc_lineage_reclaim_physical_next(
         ret = ext4_force_commit(sb);
         if (ret)
                 goto out_put;
+
+        /*
+         * Crash point 3: the physical side is now journal-durable, but
+         * persistent R has not yet been written.  This is the critical
+         * physical-durability-before-cursor-publication window.
+         */
+        ext4_brc_test_maybe_crash(sb, 3);
 
         new_reclaim_generation =
                 reclaim_generation + 1;

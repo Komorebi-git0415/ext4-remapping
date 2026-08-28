@@ -45,6 +45,7 @@
 #define EXT4_IOC_BRC_LINEAGE_BEGIN _IO('f', 49)
 #define EXT4_IOC_BRC_RECLAIM_THROUGH _IOW('f', 50, struct ext4_brc_reclaim)
 #define EXT4_IOC_BRC_CLASSIFY_PAIR _IOWR('f', 51, struct ext4_brc_classify)
+#define EXT4_IOC_BRC_RECLAIM_PHYSICAL _IO('f', 52)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 
@@ -91,6 +92,23 @@ struct fsuuid {
 };
 
 /*
+ * EXT4_IOC_BRC_RECLAIM_PHYSICAL
+ *
+ * Consume exactly one physically pending retired generation: the
+ * persistent reclaim_generation R.
+ *
+ * The ioctl takes no argument.
+ *
+ * Legal progress requires:
+ *
+ *     base_generation <= R < head_generation <= tail_generation
+ *
+ * Physical extent/bitmap changes are made durable before R advances.
+ * If no retired generation is waiting (R == HEAD), the ioctl returns
+ * ENODATA.
+ */
+
+/*
  * Arguments/results for EXT4_IOC_BRC_CLASSIFY_PAIR.
  *
  * generation identifies the retired checkpoint Cg.  The kernel
@@ -98,7 +116,7 @@ struct fsuuid {
  *
  * Legal domain:
  *
- *     base_generation <= generation < head_generation
+ *     reclaim_generation <= generation < head_generation
  *
  * Therefore Cg is retired and cannot be the persistent tail.
  * Cg+1 may itself be the tail.

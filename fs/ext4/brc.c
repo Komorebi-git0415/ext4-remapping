@@ -1413,6 +1413,750 @@ static int ext4_brc_classify_inode_pair(
 
 
 /*
+ * Resolve the relation between the CURRENT rightmost mapped extent of
+ * @old_inode and the direct persistent successor at the same logical
+ * location.
+ *
+ * Caller holds:
+ *
+ *     old_inode       i_data_sem write
+ *     successor_inode i_data_sem read
+ *
+ * The returned [start, end] range is always a suffix of the CURRENT
+ * rightmost extent of old_inode.
+ *
+ * Because both ext4 extents are linear physical mappings, once the two
+ * extents overlap, physical equality/inequality is constant throughout
+ * that overlap.  Therefore:
+ *
+ *     start = max(old_extent_start, successor_extent_start)
+ *     end   = old_extent_end
+ *
+ * gives one maximal rightmost range with a uniform BRC lifetime class.
+ */
+static int ext4_brc_rightmost_relation_locked(
+        struct inode *old_inode,
+        struct inode *successor_inode,
+        ext4_lblk_t *start,
+        ext4_lblk_t *end,
+        bool *free_data,
+        bool *found)
+{
+        struct super_block *sb = old_inode->i_sb;
+        struct ext4_ext_path *old_path = NULL;
+        struct ext4_ext_path *successor_path = NULL;
+        struct ext4_extent *old_ex;
+        struct ext4_extent *successor_ex;
+        ext4_lblk_t old_start;
+        ext4_lblk_t old_end;
+        ext4_lblk_t successor_start;
+        ext4_lblk_t successor_end;
+        ext4_lblk_t total_blocks;
+        ext4_fsblk_t old_pblk;
+        ext4_fsblk_t successor_pblk;
+        loff_t size;
+        int old_depth;
+        int successor_depth;
+        int ret = 0;
+
+        *found = false;
+
+        if (successor_inode->i_sb != sb)
+                return -EXDEV;
+
+        if (!ext4_test_inode_flag(
+                    old_inode,
+                    EXT4_INODE_EXTENTS) ||
+            !ext4_test_inode_flag(
+                    successor_inode,
+                    EXT4_INODE_EXTENTS))
+                return -EOPNOTSUPP;
+
+        if (EXT4_SB(sb)->s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
+
+        size = i_size_read(old_inode);
+
+        if (i_size_read(successor_inode) != size)
+                return -EFSCORRUPTED;
+
+        if (!size)
+                return 0;
+
+        total_blocks =
+                (size + sb->s_blocksize - 1) >>
+                sb->s_blocksize_bits;
+
+        /*
+         * Always resolve the CURRENT rightmost old extent.
+         *
+         * No path from a previous mutation is reused.
+         */
+        old_path = ext4_find_extent(
+                        old_inode,
+                        EXT_MAX_BLOCKS - 1,
+                        NULL,
+                        EXT4_EX_NOCACHE |
+                        EXT4_EX_NOFAIL);
+        if (IS_ERR(old_path))
+                return PTR_ERR(old_path);
+
+        old_depth = old_path->p_depth;
+        old_ex = old_path[old_depth].p_ext;
+
+        if (!old_ex)
+                goto out;
+
+        if (ext4_ext_is_unwritten(old_ex)) {
+                ret = -EOPNOTSUPP;
+                goto out;
+        }
+
+        old_start =
+                le32_to_cpu(old_ex->ee_block);
+
+        old_end =
+                old_start +
+                ext4_ext_get_actual_len(old_ex) - 1;
+
+        if (old_end < old_start ||
+            old_start >= total_blocks ||
+            old_end >= total_blocks) {
+                ret = -EFSCORRUPTED;
+                goto out;
+        }
+
+        /*
+         * The successor must be MAPPED at old_end.
+         *
+         * old=MAPPED, successor=HOLE is corruption only because this
+         * successor is SEALED and ledger-published.  A BUILDING child
+         * never reaches this physical reclaimer.
+         */
+        successor_path = ext4_find_extent(
+                                successor_inode,
+                                old_end,
+                                NULL,
+                                EXT4_EX_NOCACHE |
+                                EXT4_EX_NOFAIL);
+        if (IS_ERR(successor_path)) {
+                ret = PTR_ERR(successor_path);
+                successor_path = NULL;
+                goto out;
+        }
+
+        successor_depth =
+                successor_path->p_depth;
+
+        successor_ex =
+                successor_path[successor_depth].p_ext;
+
+        if (!successor_ex) {
+                ret = -EFSCORRUPTED;
+                goto out;
+        }
+
+        if (ext4_ext_is_unwritten(successor_ex)) {
+                ret = -EOPNOTSUPP;
+                goto out;
+        }
+
+        successor_start =
+                le32_to_cpu(
+                        successor_ex->ee_block);
+
+        successor_end =
+                successor_start +
+                ext4_ext_get_actual_len(
+                        successor_ex) - 1;
+
+        if (successor_end < successor_start ||
+            old_end < successor_start ||
+            old_end > successor_end) {
+                ret = -EFSCORRUPTED;
+                goto out;
+        }
+
+        *start = max(old_start,
+                     successor_start);
+        *end = old_end;
+
+        /*
+         * Compare the two physical mappings at the first logical block
+         * of the overlap.
+         *
+         * Their physical delta is constant across the complete overlap.
+         */
+        old_pblk =
+                ext4_ext_pblock(old_ex) +
+                (*start - old_start);
+
+        successor_pblk =
+                ext4_ext_pblock(successor_ex) +
+                (*start - successor_start);
+
+        /*
+         * false = SHARED_LIVE
+         * true  = DEAD_UNIQUE
+         */
+        *free_data =
+                old_pblk != successor_pblk;
+
+        *found = true;
+
+out:
+        if (successor_path)
+                ext4_free_ext_path(
+                        successor_path);
+
+        if (old_path)
+                ext4_free_ext_path(
+                        old_path);
+
+        return ret;
+}
+
+
+/*
+ * Destructively consume all CURRENT mappings of one retired checkpoint.
+ *
+ * A full read-only preflight must already have succeeded before this
+ * helper is entered.
+ *
+ * Reclamation is strictly right-to-left.  After every mutation the next
+ * loop iteration performs a fresh CURRENT-rightmost lookup.
+ */
+static int ext4_brc_reclaim_inode_pair(
+        struct inode *old_inode,
+        struct inode *successor_inode,
+        const struct ext4_brc_classify_stats *preflight)
+{
+        struct address_space *mapping =
+                old_inode->i_mapping;
+        u64 shared_done = 0;
+        u64 dead_done = 0;
+        int ret = 0;
+
+        if (successor_inode->i_sb !=
+            old_inode->i_sb)
+                return -EXDEV;
+
+        if (!IS_IMMUTABLE(old_inode) ||
+            !IS_IMMUTABLE(successor_inode))
+                return -EFSCORRUPTED;
+
+        if (EXT4_SB(old_inode->i_sb)->
+            s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
+
+        /*
+         * Follow the normal truncate/hole-punch lock hierarchy:
+         *
+         *     inode lock
+         *       -> mapping invalidate lock
+         *          -> i_data_sem
+         *
+         * Holding invalidate_lock prevents fresh page-cache population
+         * while old mappings are being detached/freed.
+         */
+        inode_lock(old_inode);
+        filemap_invalidate_lock(mapping);
+
+        /*
+         * The retired checkpoint will no longer expose these mappings.
+         * Drop its existing page-cache image before physical mutation.
+         *
+         * The inode was flushed before becoming SEALED + immutable, so
+         * Phase 4C expects no writable dirty data here.
+         */
+        truncate_inode_pages_range(
+                mapping,
+                0,
+                (loff_t)-1);
+
+        for (;;) {
+                ext4_lblk_t start;
+                ext4_lblk_t end;
+                u64 len;
+                bool free_data;
+                bool found;
+
+                down_write(
+                        &EXT4_I(old_inode)->
+                        i_data_sem);
+
+                down_read(
+                        &EXT4_I(successor_inode)->
+                        i_data_sem);
+
+                ret =
+                        ext4_brc_rightmost_relation_locked(
+                                old_inode,
+                                successor_inode,
+                                &start,
+                                &end,
+                                &free_data,
+                                &found);
+
+                if (!ret && found)
+                        ret =
+                                ext4_brc_ext_remove_rightmost(
+                                        old_inode,
+                                        start,
+                                        end,
+                                        free_data);
+
+                up_read(
+                        &EXT4_I(successor_inode)->
+                        i_data_sem);
+
+                up_write(
+                        &EXT4_I(old_inode)->
+                        i_data_sem);
+
+                if (ret)
+                        break;
+
+                if (!found)
+                        break;
+
+                len = (u64)end -
+                      (u64)start + 1;
+
+                if (free_data)
+                        dead_done += len;
+                else
+                        shared_done += len;
+
+                cond_resched();
+        }
+
+        /*
+         * Re-drop the retired inode's page-cache image after the
+         * destructive pass.
+         *
+         * This matters especially when a later range fails after some
+         * rightmost ranges have already been consumed.  R deliberately
+         * remains unchanged in that case, but the old inode must not
+         * retain cached pages for mappings that no longer exist.
+         *
+         * invalidate_lock is still held here, so no new page-cache
+         * population can race with this final cleanup.
+         */
+        truncate_inode_pages_range(
+                mapping,
+                0,
+                (loff_t)-1);
+
+
+        filemap_invalidate_unlock(mapping);
+        inode_unlock(old_inode);
+
+        if (ret)
+                return ret;
+
+        /*
+         * The destructive pass must consume exactly the mapped blocks
+         * validated by the immediately preceding preflight.
+         *
+         * old-hole blocks represent work already completed by a prior
+         * interrupted attempt and are intentionally not consumed again.
+         */
+        if (shared_done !=
+            preflight->shared_blocks ||
+            dead_done !=
+            preflight->dead_unique_blocks)
+                return -EFSCORRUPTED;
+
+        return 0;
+}
+
+
+/*
+ * Convert a legacy implicit-R header into the explicit cursor format.
+ *
+ * Phase 4 never compacts BASE, so every legacy ledger currently has:
+ *
+ *     BASE = 0
+ *     implicit R = 0
+ *
+ * Persist the feature flag first.  If a crash occurs before the later
+ * R update, the explicit cursor still decodes to the old safe value 0.
+ */
+static int
+ext4_brc_lineage_activate_reclaim_cursor_locked(
+        struct file *lineage_file,
+        struct ext4_brc_lineage_header_disk *header)
+{
+        u16 flags;
+        __le16 flags_disk;
+        loff_t flags_pos;
+        int ret;
+
+        flags = le16_to_cpu(header->flags);
+
+        if (flags &
+            EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR)
+                return 0;
+
+        /*
+         * A future ledger-compaction format must define its own cursor
+         * activation protocol.  Phase 4 has no BASE advancement.
+         */
+        if (le64_to_cpu(
+                    header->base_generation) != 0)
+                return -EOPNOTSUPP;
+
+        if (le64_to_cpu(
+                    header->reclaim_generation) != 0)
+                return -EFSCORRUPTED;
+
+        flags |=
+                EXT4_BRC_LINEAGE_F_RECLAIM_CURSOR;
+
+        flags_disk = cpu_to_le16(flags);
+
+        flags_pos = offsetof(
+                struct ext4_brc_lineage_header_disk,
+                flags);
+
+        ret = ext4_brc_file_write_exact(
+                        lineage_file,
+                        &flags_disk,
+                        sizeof(flags_disk),
+                        flags_pos);
+        if (ret)
+                return ret;
+
+        ret = vfs_fsync(
+                        lineage_file,
+                        0);
+        if (ret)
+                return ret;
+
+        header->flags = flags_disk;
+
+        return 0;
+}
+
+
+/*
+ * Persist the next physical reclamation cursor.
+ *
+ * Caller holds ext4_brc_lineage_io_mutex and has already established
+ * durability of all extent/bitmap/inode-accounting changes belonging
+ * to the consumed generation.
+ */
+static int
+ext4_brc_lineage_store_reclaim_generation_locked(
+        struct file *lineage_file,
+        struct ext4_brc_lineage_header_disk *header,
+        u64 new_reclaim_generation)
+{
+        __le64 new_disk;
+        loff_t cursor_pos;
+        int ret;
+
+        ret =
+                ext4_brc_lineage_activate_reclaim_cursor_locked(
+                        lineage_file,
+                        header);
+        if (ret)
+                return ret;
+
+        new_disk =
+                cpu_to_le64(
+                        new_reclaim_generation);
+
+        cursor_pos = offsetof(
+                struct ext4_brc_lineage_header_disk,
+                reclaim_generation);
+
+        ret = ext4_brc_file_write_exact(
+                        lineage_file,
+                        &new_disk,
+                        sizeof(new_disk),
+                        cursor_pos);
+        if (ret)
+                return ret;
+
+        ret = vfs_fsync(
+                        lineage_file,
+                        0);
+        if (ret)
+                return ret;
+
+        header->reclaim_generation =
+                new_disk;
+
+        return 0;
+}
+
+
+/*
+ * Physically reclaim exactly one persistent retired generation:
+ *
+ *     old       = C_R
+ *     successor = C_(R+1)
+ *
+ * Preconditions:
+ *
+ *     B <= R < H <= T
+ *
+ * The complete pair is first validated read-only.  No destructive
+ * mutation begins unless that preflight succeeds.
+ *
+ * R advances only after all physical changes are journal-durable.
+ *
+ * Consequently an interrupted destructive pass leaves R unchanged.
+ * A retry sees already-consumed ranges as old HOLEs and continues from
+ * the CURRENT rightmost remaining mapping.
+ */
+int ext4_brc_lineage_reclaim_physical_next(
+        struct file *lineage_file)
+{
+        struct inode *ledger_inode =
+                file_inode(lineage_file);
+        struct super_block *sb =
+                ledger_inode->i_sb;
+        struct ext4_brc_lineage_header_disk header;
+        struct ext4_brc_lineage_entry_disk old_entry;
+        struct ext4_brc_lineage_entry_disk successor_entry;
+        struct ext4_brc_classify_stats preflight;
+        struct inode *old_inode = NULL;
+        struct inode *successor_inode = NULL;
+        u64 base;
+        u64 reclaim_generation;
+        u64 head;
+        u64 nr_entries;
+        u64 tail;
+        u64 index;
+        u64 new_reclaim_generation;
+        int ret;
+
+        if (!S_ISREG(ledger_inode->i_mode))
+                return -EINVAL;
+
+        if (!(lineage_file->f_mode & FMODE_READ) ||
+            !(lineage_file->f_mode & FMODE_WRITE))
+                return -EBADF;
+
+        /*
+         * Cursor updates are positional metadata writes.
+         */
+        if (lineage_file->f_flags &
+            O_APPEND)
+                return -EINVAL;
+
+        /*
+         * One global prototype mutex serializes:
+         *
+         *     lineage append
+         *     HEAD advancement
+         *     read-only classification snapshot
+         *     physical reclamation
+         *     R advancement
+         *
+         * This intentionally favors correctness over concurrency.
+         */
+        mutex_lock(
+                &ext4_brc_lineage_io_mutex);
+
+        ret = ext4_brc_file_read_exact(
+                        lineage_file,
+                        &header,
+                        sizeof(header),
+                        0);
+        if (ret)
+                goto out_unlock;
+
+        ret =
+                ext4_brc_lineage_validate_header_format(
+                        &header);
+        if (ret)
+                goto out_unlock;
+
+        base = le64_to_cpu(
+                        header.base_generation);
+
+        reclaim_generation =
+                ext4_brc_lineage_reclaim_generation(
+                        &header);
+
+        head = le64_to_cpu(
+                        header.head_generation);
+
+        nr_entries = le64_to_cpu(
+                        header.nr_entries);
+
+        if (!nr_entries) {
+                ret = -ENODATA;
+                goto out_unlock;
+        }
+
+        tail = base + nr_entries - 1;
+
+        /*
+         * No logically retired generation is waiting for physical
+         * reclamation.
+         */
+        if (reclaim_generation >= head) {
+                ret = -ENODATA;
+                goto out_unlock;
+        }
+
+        /*
+         * Given B <= R < H <= T, R must have a direct persistent
+         * successor and therefore can never be the current tail.
+         */
+        if (reclaim_generation >= tail) {
+                ret = -EFSCORRUPTED;
+                goto out_unlock;
+        }
+
+        index =
+                reclaim_generation - base;
+
+        ret = ext4_brc_lineage_read_entry(
+                        lineage_file,
+                        index,
+                        &old_entry);
+        if (ret)
+                goto out_unlock;
+
+        ret = ext4_brc_lineage_read_entry(
+                        lineage_file,
+                        index + 1,
+                        &successor_entry);
+        if (ret)
+                goto out_unlock;
+
+        old_inode =
+                ext4_brc_resolve_checkpoint(
+                        sb,
+                        &header,
+                        &old_entry,
+                        reclaim_generation);
+        if (IS_ERR(old_inode)) {
+                ret = PTR_ERR(old_inode);
+                old_inode = NULL;
+                goto out_unlock;
+        }
+
+        successor_inode =
+                ext4_brc_resolve_checkpoint(
+                        sb,
+                        &header,
+                        &successor_entry,
+                        reclaim_generation + 1);
+        if (IS_ERR(successor_inode)) {
+                ret = PTR_ERR(successor_inode);
+                successor_inode = NULL;
+                goto out_put;
+        }
+
+        /*
+         * PRE-FLIGHT.
+         *
+         * This is strictly read-only.  In particular:
+         *
+         * old MAPPED / successor HOLE
+         *
+         * is detected before the first destructive range is touched.
+         *
+         * On restart, old HOLE ranges created by an earlier interrupted
+         * pass are legal and simply represent already-completed work.
+         */
+        memset(&preflight,
+               0,
+               sizeof(preflight));
+
+        ret =
+                ext4_brc_classify_inode_pair(
+                        old_inode,
+                        successor_inode,
+                        &preflight);
+        if (ret)
+                goto out_put;
+
+        /*
+         * Only after the whole current pair has passed preflight do we
+         * permit destructive right-to-left reclamation.
+         */
+        ret =
+                ext4_brc_reclaim_inode_pair(
+                        old_inode,
+                        successor_inode,
+                        &preflight);
+        if (ret)
+                goto out_put;
+
+        /*
+         * Every individual extent mutation has completed its ext4
+         * transaction, but R must not advance until those filesystem
+         * metadata changes are durably committed.
+         */
+        ret = ext4_force_commit(sb);
+        if (ret)
+                goto out_put;
+
+        new_reclaim_generation =
+                reclaim_generation + 1;
+
+        /*
+         * Publish R only after the physical side is durable.
+         */
+        ret =
+                ext4_brc_lineage_store_reclaim_generation_locked(
+                        lineage_file,
+                        &header,
+                        new_reclaim_generation);
+        if (ret)
+                goto out_put;
+
+        ext4_msg(
+                sb,
+                KERN_INFO,
+                "BRC_RECLAIM_PHYSICAL: ledger_inode=%lu generation=%llu successor=%llu shared=%llu dead_unique=%llu old_holes=%llu old_R=%llu new_R=%llu head=%llu tail=%llu",
+                ledger_inode->i_ino,
+                (unsigned long long)
+                        reclaim_generation,
+                (unsigned long long)
+                        (reclaim_generation + 1),
+                (unsigned long long)
+                        preflight.shared_blocks,
+                (unsigned long long)
+                        preflight.dead_unique_blocks,
+                (unsigned long long)
+                        preflight.old_hole_blocks,
+                (unsigned long long)
+                        reclaim_generation,
+                (unsigned long long)
+                        new_reclaim_generation,
+                (unsigned long long)
+                        head,
+                (unsigned long long)
+                        tail);
+
+        ret = 0;
+
+out_put:
+        if (successor_inode)
+                iput(successor_inode);
+
+        if (old_inode)
+                iput(old_inode);
+
+out_unlock:
+        mutex_unlock(
+                &ext4_brc_lineage_io_mutex);
+
+        return ret;
+}
+
+
+
+/*
  * Phase 4C read-only adjacent-checkpoint liveness classifier.
  *
  * Persistent lineage state:
@@ -1539,12 +2283,15 @@ int ext4_brc_lineage_classify_pair(
         }
 
         /*
-         * Phase 4C inference is valid only while the retired
-         * predecessor still has its original physical mappings.
+         * Phase 4C classification is defined over the CURRENT remaining
+         * mapping state of the physically pending retired prefix.
          *
-         * Once generation < R, physical reclamation has already
-         * consumed that checkpoint and its remaining extent tree can
-         * no longer be treated as the original mapping snapshot.
+         * generation == R may already contain old HOLE ranges after an
+         * interrupted physical reclamation attempt.  Those holes are
+         * legal completed work.
+         *
+         * Once generation < R, that checkpoint has been fully consumed
+         * and must no longer participate in pair classification.
          */
         if (generation < reclaim_generation ||
             generation >= head) {

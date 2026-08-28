@@ -2475,15 +2475,28 @@ static void ext4_rereserve_cluster(struct inode *inode, ext4_lblk_t lblk)
 }
 
 static int ext4_remove_blocks(handle_t *handle, struct inode *inode,
-			      struct ext4_extent *ex,
-			      struct partial_cluster *partial,
-			      ext4_lblk_t from, ext4_lblk_t to)
+                              struct ext4_extent *ex,
+                              struct partial_cluster *partial,
+                              ext4_lblk_t from, ext4_lblk_t to,
+                              bool free_data,
+                              bool *brc_accounting_changed)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 	unsigned short ee_len = ext4_ext_get_actual_len(ex);
 	ext4_fsblk_t last_pblk, pblk;
 	ext4_lblk_t num;
 	int flags;
+
+        /*
+         * Phase-4C shared mapping detachment is defined only at
+         * ordinary ext4 filesystem-block granularity.
+         *
+         * Shared-cluster lifetime under bigalloc is deliberately
+         * outside the current BRC prototype.
+         */
+        if (!free_data && sbi->s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
+
 
 	/* only extent tail removal is allowed */
 	if (from < le32_to_cpu(ex->ee_block) ||
@@ -2564,8 +2577,45 @@ static int ext4_remove_blocks(handle_t *handle, struct inode *inode,
 	 * need to free it on a subsequent call to ext4_remove_blocks,
 	 * or at the end of ext4_ext_rm_leaf or ext4_ext_remove_space.
 	 */
-	flags |= EXT4_FREE_BLOCKS_NOFREE_FIRST_CLUSTER;
-	ext4_free_blocks(handle, inode, NULL, pblk, num, flags);
+        flags |= EXT4_FREE_BLOCKS_NOFREE_FIRST_CLUSTER;
+
+        if (free_data) {
+                /*
+                 * Normal ext4 ownership semantics.
+                 *
+                 * DEAD_UNIQUE BRC ranges use the same path: this old
+                 * checkpoint is the final BRC owner, so the physical
+                 * data blocks can be returned to ext4 normally.
+                 */
+                ext4_free_blocks(handle, inode, NULL,
+                                 pblk, num, flags);
+        } else {
+                loff_t bytes;
+
+                /*
+                 * BRC SHARED_LIVE detach.
+                 *
+                 * The direct successor still maps these exact
+                 * physical blocks.  Remove only this old inode's
+                 * logical/accounting ownership.
+                 *
+                 * In particular, do NOT:
+                 *
+                 *     ext4_free_blocks()
+                 *     clear the allocation bitmap
+                 *     release data quota
+                 *
+                 * BRC inheritance installed shared mappings using
+                 * inode_add_bytes() without allocating or charging a
+                 * second physical copy.  Its accounting inverse is
+                 * therefore inode_sub_bytes().
+                 */
+                bytes = (loff_t)num << inode->i_blkbits;
+                inode_sub_bytes(inode, bytes);
+
+                if (brc_accounting_changed)
+                        *brc_accounting_changed = true;
+        }
 
 	/* reset the partial cluster if we've freed past it */
 	if (partial->state != initial && partial->pclu != EXT4_B2C(sbi, pblk))
@@ -2611,9 +2661,11 @@ static int ext4_remove_blocks(handle_t *handle, struct inode *inode,
  */
 static int
 ext4_ext_rm_leaf(handle_t *handle, struct inode *inode,
-		 struct ext4_ext_path *path,
-		 struct partial_cluster *partial,
-		 ext4_lblk_t start, ext4_lblk_t end)
+                 struct ext4_ext_path *path,
+                 struct partial_cluster *partial,
+                 ext4_lblk_t start, ext4_lblk_t end,
+                 bool free_data,
+                 bool *brc_accounting_changed)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 	int err = 0, correct_index = 0;
@@ -2730,7 +2782,9 @@ ext4_ext_rm_leaf(handle_t *handle, struct inode *inode,
 		if (err)
 			goto out;
 
-		err = ext4_remove_blocks(handle, inode, ex, partial, a, b);
+		err = ext4_remove_blocks(handle, inode, ex, partial,
+                                         a, b, free_data,
+                                         brc_accounting_changed);
 		if (err)
 			goto out;
 
@@ -2833,15 +2887,25 @@ ext4_ext_more_to_rm(struct ext4_ext_path *path)
 	return 1;
 }
 
-int ext4_ext_remove_space(struct inode *inode, ext4_lblk_t start,
-			  ext4_lblk_t end)
+static int __ext4_ext_remove_space(struct inode *inode,
+                                   ext4_lblk_t start,
+                                   ext4_lblk_t end,
+                                   bool free_data)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 	int depth = ext_depth(inode);
 	struct ext4_ext_path *path = NULL;
 	struct partial_cluster partial;
 	handle_t *handle;
+        bool brc_accounting_changed = false;
 	int i = 0, err = 0;
+
+        /*
+         * The mapping-only BRC path deliberately excludes bigalloc.
+         * Ordinary ext4 physical removal is unchanged.
+         */
+        if (!free_data && sbi->s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
 
 	partial.pclu = 0;
 	partial.lblk = 0;
@@ -2980,7 +3044,9 @@ again:
 		if (i == depth) {
 			/* this is leaf block */
 			err = ext4_ext_rm_leaf(handle, inode, path,
-					       &partial, start, end);
+                                               &partial, start, end,
+                                               free_data,
+                                               &brc_accounting_changed);
 			/* root level has p_bh == NULL, brelse() eats this */
 			ext4_ext_path_brelse(path + i);
 			i--;
@@ -3085,18 +3151,240 @@ again:
 		}
 	}
 out:
-	ext4_free_ext_path(path);
-	path = NULL;
-	if (err == -EAGAIN)
-		goto again;
-	ext4_journal_stop(handle);
+        ext4_free_ext_path(path);
+        path = NULL;
 
-	return err;
+        /*
+         * Scheme B for BRC SHARED_LIVE accounting.
+         *
+         * inode_sub_bytes() updates in-memory i_blocks accounting but
+         * does not itself provide ext4 transaction-aware persistence.
+         *
+         * If this invocation detached shared data, capture the final
+         * inode accounting state once before leaving the transaction.
+         *
+         * Do this even if a later extent-tree operation failed:
+         * an earlier shared suffix may already have been detached.
+         */
+        if (brc_accounting_changed) {
+                int dirty_err;
+
+                dirty_err = ext4_mark_inode_dirty(handle, inode);
+
+                /*
+                 * Preserve a substantive mutation error.  Otherwise a
+                 * dirtying failure supersedes success or the internal
+                 * EAGAIN retry signal.
+                 */
+                if (dirty_err &&
+                    (!err || err == -EAGAIN))
+                        err = dirty_err;
+        }
+
+        if (err == -EAGAIN)
+                goto again;
+
+        ext4_journal_stop(handle);
+
+        return err;
 }
 
 /*
  * called at mount time
  */
+
+/*
+ * Preserve ordinary ext4 semantics for every pre-existing caller:
+ *
+ *     logical mapping removal
+ *         +
+ *     physical data-block release
+ */
+int ext4_ext_remove_space(struct inode *inode, ext4_lblk_t start,
+                          ext4_lblk_t end)
+{
+        return __ext4_ext_remove_space(inode,
+                                      start,
+                                      end,
+                                      true);
+}
+
+
+/*
+ * Remove one suffix of the CURRENT rightmost mapped extent of an old
+ * sealed BRC checkpoint.
+ *
+ * The caller must hold EXT4_I(inode)->i_data_sem for write.
+ *
+ * Phase-4C physical reclamation proceeds strictly right-to-left.
+ * Therefore every invocation performs a fresh extent lookup.
+ *
+ * No path or p_ext obtained before an earlier mutation may be reused.
+ *
+ * Example:
+ *
+ *     before:
+ *
+ *         [100, 200)
+ *
+ *     reclaim:
+ *
+ *         [190, 200)
+ *
+ *     after:
+ *
+ *         [100, 190)
+ *
+ * A subsequent invocation performs another ext4_find_extent() and
+ * sees [100, 190) as the new current rightmost extent.
+ *
+ * free_data == false:
+ *
+ *     SHARED_LIVE
+ *     remove old mapping/accounting only
+ *     keep the physical blocks allocated
+ *
+ * free_data == true:
+ *
+ *     DEAD_UNIQUE
+ *     remove old mapping/accounting
+ *     physically release the data blocks
+ *
+ * Page-cache invalidation belongs to the higher BRC physical
+ * reclaimer and must occur before it acquires i_data_sem, following
+ * ext4's normal hole-punch lock ordering.
+ */
+int ext4_brc_ext_remove_rightmost(struct inode *inode,
+                                  ext4_lblk_t start,
+                                  ext4_lblk_t end,
+                                  bool free_data)
+{
+        struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+        struct ext4_ext_path *path;
+        struct ext4_extent *ex;
+        ext4_lblk_t ex_start;
+        ext4_lblk_t ex_end;
+        ext4_lblk_t len;
+        int depth;
+        int ret;
+
+        if (start > end)
+                return -EINVAL;
+
+        if (!ext4_test_inode_flag(inode, EXT4_INODE_EXTENTS))
+                return -EOPNOTSUPP;
+
+        /*
+         * Current BRC shared-block lifetime is defined at filesystem
+         * block granularity, not bigalloc cluster granularity.
+         */
+        if (sbi->s_cluster_ratio != 1)
+                return -EOPNOTSUPP;
+
+        /*
+         * Userspace must not be able to modify a checkpoint while BRC
+         * physically detaches mappings from it.
+         */
+        if (!IS_IMMUTABLE(inode))
+                return -EPERM;
+
+        /*
+         * ALWAYS resolve the CURRENT rightmost extent.
+         *
+         * EXT_MAX_BLOCKS - 1 makes ext4_find_extent() return the final
+         * mapped extent when the file has trailing holes.
+         */
+        path = ext4_find_extent(inode,
+                                EXT_MAX_BLOCKS - 1,
+                                NULL,
+                                EXT4_EX_NOCACHE |
+                                EXT4_EX_NOFAIL);
+        if (IS_ERR(path))
+                return PTR_ERR(path);
+
+        depth = path->p_depth;
+        ex = path[depth].p_ext;
+
+        if (!ex) {
+                ext4_free_ext_path(path);
+                return -ENODATA;
+        }
+
+        if (ext4_ext_is_unwritten(ex)) {
+                ext4_free_ext_path(path);
+                return -EOPNOTSUPP;
+        }
+
+        ex_start = le32_to_cpu(ex->ee_block);
+        ex_end = ex_start +
+                 ext4_ext_get_actual_len(ex) - 1;
+
+        if (ex_end < ex_start) {
+                ext4_free_ext_path(path);
+                return -EFSCORRUPTED;
+        }
+
+        /*
+         * Hard Phase-4C mutation invariant:
+         *
+         *     [start, end]
+         *
+         * must be a suffix of the CURRENT rightmost extent.
+         *
+         * This is what makes partial rightmost reclamation naturally
+         * restartable:
+         *
+         *     [100, 200) -> remove [190, 200)
+         *     [100, 190) -> next CURRENT rightmost extent
+         */
+        if (end != ex_end ||
+            start < ex_start ||
+            start > ex_end) {
+                ext4_free_ext_path(path);
+                return -EINVAL;
+        }
+
+        len = end - start + 1;
+
+        if (!len) {
+                ext4_free_ext_path(path);
+                return -EOVERFLOW;
+        }
+
+        /*
+         * The lookup path becomes invalid as soon as the extent tree
+         * changes.  Drop it before entering the mutator.
+         */
+        ext4_free_ext_path(path);
+
+        /*
+         * Remove potentially stale ES information before mutating the
+         * on-disk extent tree.  A later lookup can repopulate it.
+         */
+        ext4_es_remove_extent(inode, start, len);
+
+        ret = __ext4_ext_remove_space(inode,
+                                      start,
+                                      end,
+                                      free_data);
+        if (ret)
+                return ret;
+
+        /*
+         * The old checkpoint now presents a hole over the successfully
+         * detached suffix.
+         */
+        ext4_es_insert_extent(inode,
+                              start,
+                              len,
+                              ~0,
+                              EXTENT_STATUS_HOLE,
+                              0);
+
+        return 0;
+}
+
+
 void ext4_ext_init(struct super_block *sb)
 {
 	/*

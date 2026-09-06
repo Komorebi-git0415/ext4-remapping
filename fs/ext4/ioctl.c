@@ -1615,6 +1615,9 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case EXT4_IOC_BRC_LINEAGE_BEGIN:
 		return ext4_brc_lineage_begin(filp);
 
+	case EXT4_IOC_BRC_LINEAGE_RESUME:
+		return ext4_brc_lineage_resume(filp);
+
 	case EXT4_IOC_BRC_SESSION_BEGIN:
 	        if (!S_ISDIR(inode->i_mode))
 	                return -ENOTDIR;

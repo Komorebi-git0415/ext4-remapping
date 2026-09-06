@@ -46,6 +46,7 @@
 #define EXT4_IOC_BRC_RECLAIM_THROUGH _IOW('f', 50, struct ext4_brc_reclaim)
 #define EXT4_IOC_BRC_CLASSIFY_PAIR _IOWR('f', 51, struct ext4_brc_classify)
 #define EXT4_IOC_BRC_RECLAIM_PHYSICAL _IO('f', 52)
+#define EXT4_IOC_BRC_LINEAGE_RESUME _IO('f', 53)
 
 #define EXT4_IOC_SHUTDOWN _IOR('X', 125, __u32)
 

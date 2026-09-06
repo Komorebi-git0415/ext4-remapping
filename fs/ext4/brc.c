@@ -1196,6 +1196,129 @@ ext4_brc_resolve_checkpoint(
         return inode;
 }
 
+/*
+ * Reconstruct an ephemeral BRC session from an existing persistent
+ * lineage ledger.
+ *
+ * Only the ledger-published checkpoint prefix is authoritative.
+ * A possible unpublished generation T+1 is deliberately not restored
+ * here and must be handled separately by the BRC abort path.
+ */
+int ext4_brc_lineage_resume(struct file *lineage_file)
+{
+	struct inode *ledger_inode = file_inode(lineage_file);
+	struct ext4_brc_lineage_header_disk header;
+	struct ext4_brc_lineage_entry_disk entry;
+	struct ext4_brc_session *session;
+	struct inode *tail_inode = NULL;
+	u64 base;
+	u64 nr_entries;
+	u64 tail_index;
+	u64 tail_generation;
+	int fd;
+	int ret;
+
+	if (!S_ISREG(ledger_inode->i_mode))
+		return -EINVAL;
+
+	if (!(lineage_file->f_mode & FMODE_READ) ||
+	    !(lineage_file->f_mode & FMODE_WRITE))
+		return -EBADF;
+
+	mutex_lock(&ext4_brc_lineage_io_mutex);
+
+	ret = ext4_brc_file_read_exact(lineage_file,
+				       &header,
+				       sizeof(header),
+				       0);
+	if (ret)
+		goto out_unlock;
+
+	ret = ext4_brc_lineage_validate_header_format(&header);
+	if (ret)
+		goto out_unlock;
+
+	base = le64_to_cpu(header.base_generation);
+	nr_entries = le64_to_cpu(header.nr_entries);
+
+	if (!nr_entries) {
+		ret = -ENODATA;
+		goto out_unlock;
+	}
+
+	tail_index = nr_entries - 1;
+	tail_generation = base + tail_index;
+
+	ret = ext4_brc_lineage_read_entry(lineage_file,
+					  tail_index,
+					  &entry);
+	if (ret)
+		goto out_unlock;
+
+	tail_inode = ext4_brc_resolve_checkpoint(
+				ledger_inode->i_sb,
+				&header,
+				&entry,
+				tail_generation);
+	if (IS_ERR(tail_inode)) {
+		ret = PTR_ERR(tail_inode);
+		tail_inode = NULL;
+		goto out_unlock;
+	}
+
+	session = kzalloc(sizeof(*session), GFP_KERNEL);
+	if (!session) {
+		ret = -ENOMEM;
+		goto out_tail;
+	}
+
+	get_file(lineage_file);
+	session->anchor_file = lineage_file;
+	session->lineage_file = lineage_file;
+
+	memcpy(session->lineage,
+	       &header.lineage_hi,
+	       sizeof(header.lineage_hi));
+	memcpy(session->lineage + sizeof(header.lineage_hi),
+	       &header.lineage_lo,
+	       sizeof(header.lineage_lo));
+
+	session->generation = tail_generation;
+	session->tail_inode = tail_inode;
+	tail_inode = NULL;
+	session->building_inode = NULL;
+	mutex_init(&session->lock);
+
+	fd = anon_inode_getfd("[ext4-brc-lineage-session]",
+			      &ext4_brc_session_fops,
+			      session,
+			      O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		ret = fd;
+		iput(session->tail_inode);
+		fput(session->anchor_file);
+		kfree(session);
+		goto out_unlock;
+	}
+
+	mutex_unlock(&ext4_brc_lineage_io_mutex);
+
+	ext4_msg(ledger_inode->i_sb, KERN_INFO,
+		 "BRC_LINEAGE_RESUME: ledger_inode=%lu tail_inode=%lu generation=%llu session_fd=%d",
+		 ledger_inode->i_ino,
+		 session->tail_inode->i_ino,
+		 (unsigned long long)tail_generation,
+		 fd);
+
+	return fd;
+
+out_tail:
+	iput(tail_inode);
+
+out_unlock:
+	mutex_unlock(&ext4_brc_lineage_io_mutex);
+	return ret;
+}
 
 /*
  * Classify physical-block liveness between two verified adjacent

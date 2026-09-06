@@ -18,6 +18,7 @@ int ext4_brc_lineage_classify_pair(
         struct ext4_brc_classify_stats *stats);
 
 int ext4_brc_lineage_begin(struct file *lineage_file);
+int ext4_brc_lineage_resume(struct file *lineage_file);
 int ext4_brc_lineage_reclaim_through(struct file *lineage_file,
                                      u64 through_generation);
 int ext4_brc_lineage_reclaim_physical_next(

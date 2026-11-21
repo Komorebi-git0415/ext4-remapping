@@ -537,6 +537,64 @@ out_stop:
 }
 
 
+
+/*
+ * Drop the immutable protection installed by BRC.
+ *
+ * LINEAGE_DESTROY uses this only after the checkpoint has been
+ * independently resolved and verified through trusted.brc.
+ *
+ * Prototype teardown ordering is deliberately:
+ *
+ *     clear immutable -> remove trusted.brc
+ *
+ * Never remove the BRC identity first: doing so could leave an
+ * immutable checkpoint that can no longer be identified as BRC-owned.
+ */
+static int ext4_brc_clear_immutable(struct inode *inode)
+{
+        handle_t *handle;
+        struct ext4_iloc iloc;
+        int ret;
+        int stop_ret;
+
+        if (!IS_IMMUTABLE(inode))
+                return 0;
+
+        inode_dio_wait(inode);
+
+        ret = filemap_write_and_wait(inode->i_mapping);
+        if (ret)
+                return ret;
+
+        handle = ext4_journal_start(inode, EXT4_HT_INODE, 1);
+        if (IS_ERR(handle))
+                return PTR_ERR(handle);
+
+        if (IS_SYNC(inode))
+                ext4_handle_sync(handle);
+
+        ret = ext4_reserve_inode_write(handle, inode, &iloc);
+        if (ret)
+                goto out_stop;
+
+        ext4_clear_inode_flag(inode, EXT4_INODE_IMMUTABLE);
+        ext4_set_inode_flags(inode, false);
+
+        inode_set_ctime_current(inode);
+        inode_inc_iversion(inode);
+
+        ret = ext4_mark_iloc_dirty(handle, inode, &iloc);
+
+out_stop:
+        stop_ret = ext4_journal_stop(handle);
+        if (!ret)
+                ret = stop_ret;
+
+        return ret;
+}
+
+
 static void ext4_brc_meta_init(struct ext4_brc_meta_disk *meta,
                                struct ext4_brc_session *session,
                                u16 state,
@@ -2340,6 +2398,329 @@ out_unlock:
         return ret;
 }
 
+
+
+
+/*
+ * Finalize one complete BRC lineage for ordinary userspace deletion.
+ *
+ * This is intentionally an additive wrapper around the existing Phase-4
+ * reclamation machinery.  It does not introduce another block-reclamation
+ * algorithm.
+ *
+ * On entry the lineage may still contain several live/pending checkpoints.
+ * We first drive it to:
+ *
+ *     R == H == T
+ *
+ * using the existing logical and physical GC operations.  The final tail
+ * C_T is then independently resolved from the persistent ledger and its
+ * BRC ownership protection is removed.
+ *
+ * No directory entry is unlinked here.  After success, userspace may use
+ * normal unlink(2)/rm on C*.img and finally on lineage.ledger, leaving
+ * ordinary ext4 responsible for final inode/data/metadata deletion.
+ *
+ * Crash consistency of the final protection teardown is intentionally
+ * outside the first research-prototype boundary.  The normal execution
+ * ordering is nevertheless chosen so that trusted.brc is never removed
+ * before immutable has successfully been cleared.
+ */
+int ext4_brc_lineage_destroy(struct file *lineage_file)
+{
+        struct inode *ledger_inode = file_inode(lineage_file);
+        struct super_block *sb = ledger_inode->i_sb;
+        struct ext4_brc_lineage_header_disk header;
+        struct ext4_brc_lineage_entry_disk tail_entry;
+        struct inode *tail_inode = NULL;
+        u64 base;
+        u64 reclaim_generation;
+        u64 head;
+        u64 nr_entries;
+        u64 tail;
+        int ret;
+
+        if (!S_ISREG(ledger_inode->i_mode))
+                return -EINVAL;
+
+        if (!(lineage_file->f_mode & FMODE_READ) ||
+            !(lineage_file->f_mode & FMODE_WRITE))
+                return -EBADF;
+
+        if (lineage_file->f_flags & O_APPEND)
+                return -EINVAL;
+
+        /*
+         * First obtain a validated snapshot only to determine T and the
+         * amount of logical GC still required.
+         */
+        mutex_lock(&ext4_brc_lineage_io_mutex);
+
+        ret = ext4_brc_file_read_exact(
+                        lineage_file,
+                        &header,
+                        sizeof(header),
+                        0);
+        if (ret)
+                goto out_initial_unlock;
+
+        ret = ext4_brc_lineage_validate_header_format(&header);
+        if (ret)
+                goto out_initial_unlock;
+
+        base = le64_to_cpu(header.base_generation);
+        head = le64_to_cpu(header.head_generation);
+        nr_entries = le64_to_cpu(header.nr_entries);
+
+        if (!nr_entries) {
+                ret = -ENODATA;
+                goto out_initial_unlock;
+        }
+
+        tail = base + nr_entries - 1;
+
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+
+        /*
+         * RECLAIM_THROUGH intentionally refuses through >= T.
+         * Therefore T-1 is exactly the strongest legal logical GC:
+         *
+         *     H := T
+         *
+         * If H is already T there is nothing to do.
+         */
+        if (head < tail) {
+                ret = ext4_brc_lineage_reclaim_through(
+                                lineage_file,
+                                tail - 1);
+                if (ret)
+                        return ret;
+        }
+
+        /*
+         * Consume every physically pending retired generation.
+         *
+         * reclaim_physical_next() returns ENODATA exactly when R == H.
+         * Since logical GC above established H == T, ENODATA means the
+         * desired terminal physical state R == H == T has been reached.
+         */
+        for (;;) {
+                struct ext4_brc_lineage_header_disk gc_header;
+                struct ext4_brc_lineage_entry_disk retired_entry;
+                struct inode *retired_inode;
+                u64 old_reclaim;
+                u64 gc_base;
+
+                /*
+                 * Snapshot the generation that is about to be physically
+                 * reclaimed.  reclaim_physical_next() advances persistent R
+                 * only after the extent changes are journal-durable.
+                 */
+                mutex_lock(&ext4_brc_lineage_io_mutex);
+
+                ret = ext4_brc_file_read_exact(
+                                lineage_file,
+                                &gc_header,
+                                sizeof(gc_header),
+                                0);
+                if (ret) {
+                        mutex_unlock(&ext4_brc_lineage_io_mutex);
+                        return ret;
+                }
+
+                ret = ext4_brc_lineage_validate_header_format(
+                                &gc_header);
+                if (ret) {
+                        mutex_unlock(&ext4_brc_lineage_io_mutex);
+                        return ret;
+                }
+
+                gc_base = le64_to_cpu(gc_header.base_generation);
+                old_reclaim =
+                        ext4_brc_lineage_reclaim_generation(&gc_header);
+
+                mutex_unlock(&ext4_brc_lineage_io_mutex);
+
+                ret = ext4_brc_lineage_reclaim_physical_next(
+                                lineage_file);
+
+                if (ret == -ENODATA)
+                        break;
+
+                if (ret)
+                        return ret;
+
+                /*
+                 * Physical reclamation of C_old_reclaim is complete and R
+                 * has advanced durably.  The retired checkpoint is no longer
+                 * an inheritance source.  Drop only its BRC ownership
+                 * protection; userspace remains responsible for unlink(2).
+                 */
+                mutex_lock(&ext4_brc_lineage_io_mutex);
+
+                ret = ext4_brc_lineage_read_entry(
+                                lineage_file,
+                                old_reclaim - gc_base,
+                                &retired_entry);
+                if (ret)
+                        goto out_retired_unlock;
+
+                retired_inode = ext4_brc_resolve_checkpoint(
+                                sb,
+                                &gc_header,
+                                &retired_entry,
+                                old_reclaim);
+                if (IS_ERR(retired_inode)) {
+                        ret = PTR_ERR(retired_inode);
+                        goto out_retired_unlock;
+                }
+
+                inode_lock(retired_inode);
+
+                ret = ext4_brc_clear_immutable(retired_inode);
+                if (!ret)
+                        ret = ext4_xattr_set(
+                                        retired_inode,
+                                        EXT4_XATTR_INDEX_TRUSTED,
+                                        EXT4_BRC_XATTR_NAME,
+                                        NULL, 0,
+                                        XATTR_REPLACE);
+
+                inode_unlock(retired_inode);
+                iput(retired_inode);
+
+out_retired_unlock:
+                mutex_unlock(&ext4_brc_lineage_io_mutex);
+
+                if (ret)
+                        return ret;
+
+                cond_resched();
+        }
+
+        /*
+         * Re-read everything after GC.  Do not trust the earlier snapshot
+         * for final ownership teardown.
+         */
+        mutex_lock(&ext4_brc_lineage_io_mutex);
+
+        ret = ext4_brc_file_read_exact(
+                        lineage_file,
+                        &header,
+                        sizeof(header),
+                        0);
+        if (ret)
+                goto out_final_unlock;
+
+        ret = ext4_brc_lineage_validate_header_format(&header);
+        if (ret)
+                goto out_final_unlock;
+
+        base = le64_to_cpu(header.base_generation);
+        reclaim_generation =
+                ext4_brc_lineage_reclaim_generation(&header);
+        head = le64_to_cpu(header.head_generation);
+        nr_entries = le64_to_cpu(header.nr_entries);
+
+        if (!nr_entries) {
+                ret = -ENODATA;
+                goto out_final_unlock;
+        }
+
+        tail = base + nr_entries - 1;
+
+        /*
+         * This is the only state in which final-tail ownership teardown
+         * is permitted.
+         */
+        if (reclaim_generation != tail || head != tail) {
+                ret = -EFSCORRUPTED;
+                goto out_final_unlock;
+        }
+
+        ret = ext4_brc_lineage_read_entry(
+                        lineage_file,
+                        tail - base,
+                        &tail_entry);
+        if (ret)
+                goto out_final_unlock;
+
+        /*
+         * Existing resolver verifies:
+         *   inode number
+         *   inode generation
+         *   regular-file type
+         *   immutable
+         *   trusted.brc magic/version/state
+         *   lineage identity
+         *   checkpoint generation == T
+         */
+        tail_inode = ext4_brc_resolve_checkpoint(
+                        sb,
+                        &header,
+                        &tail_entry,
+                        tail);
+        if (IS_ERR(tail_inode)) {
+                ret = PTR_ERR(tail_inode);
+                tail_inode = NULL;
+                goto out_final_unlock;
+        }
+
+        /*
+         * Keep the ledger serialization lock across final ownership
+         * teardown so no BRC ledger operation can interleave here.
+         *
+         * inode_lock protects the checkpoint while its protection state
+         * is changed.
+         */
+        inode_lock(tail_inode);
+
+        ret = ext4_brc_clear_immutable(tail_inode);
+        if (ret)
+                goto out_tail_unlock;
+
+        /*
+         * Only after immutable is known to be clear may BRC identity be
+         * removed.  If this xattr removal fails, userspace still has a
+         * deletable non-immutable inode and the marker remains available
+         * for diagnosis/retry; we never create the opposite orphan state
+         * (immutable but markerless) on the normal path.
+         */
+        ret = ext4_xattr_set(
+                        tail_inode,
+                        EXT4_XATTR_INDEX_TRUSTED,
+                        EXT4_BRC_XATTR_NAME,
+                        NULL, 0,
+                        XATTR_REPLACE);
+        if (ret)
+                goto out_tail_unlock;
+
+        ext4_msg(
+                sb,
+                KERN_INFO,
+                "BRC_LINEAGE_DESTROY: ledger_inode=%lu tail_inode=%lu generation=%llu R=%llu H=%llu T=%llu",
+                ledger_inode->i_ino,
+                tail_inode->i_ino,
+                (unsigned long long)tail,
+                (unsigned long long)reclaim_generation,
+                (unsigned long long)head,
+                (unsigned long long)tail);
+
+        ret = 0;
+
+out_tail_unlock:
+        inode_unlock(tail_inode);
+        iput(tail_inode);
+        tail_inode = NULL;
+
+out_final_unlock:
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+        return ret;
+
+out_initial_unlock:
+        mutex_unlock(&ext4_brc_lineage_io_mutex);
+        return ret;
+}
 
 
 /*
